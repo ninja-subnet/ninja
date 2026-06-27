@@ -1497,6 +1497,14 @@ _COMPRESSED_MESSAGE_CHARS = 1600
 _COMPRESSED_FLOOR_CHARS = 500
 _MIN_REST_MESSAGES = 4
 _WRITE_DEADLINE_STEP = 10
+# RICH-ROUND TIMEOUT SALVAGE (beater): the rich localizer's +5000-char context makes
+# the weak model spend its wall-clock READING and time out with NOTHING on disk
+# (c=0.00 auto-loss). On rich rounds ONLY, fire the existing write-deadline nudge once
+# 80% of the wall-clock is spent AND the disk is still EMPTY -- so a doomed round emits
+# its best partial (c>0) instead of nothing. Fires LATE + empty-disk-only => every round
+# that already wrote (incl. the timeout-WINS that ARE our +4) is byte-identical/untouched.
+_RICH_WRITE_DEADLINE_FRACTION = 0.80
+_RICH_CONTEXT_MARKER = "RELEVANT CURRENT SOURCE (read-only reference"
 
 
 def _write_deadline_message(step: int) -> str:
@@ -1674,6 +1682,9 @@ def run_agent_loop(*, config: AgentRunConfig, task: str) -> AgentOutcome:
         {"role": "user", "content": task if "<task>" in task else build_task_prompt(task_text=task)},
     ]
     started = time.monotonic()
+    # rich-round detection (no signature change): the localizer's header appears in the
+    # attempt-1 task iff the rich tier fired. Used to gate the late timeout-salvage nudge.
+    _rich_active = _RICH_CONTEXT_MARKER in (task or "")
     log_lines: list = []
     exit_status = "LimitsExceeded"
     message = f"step limit of {config.max_steps} reached"
@@ -1685,12 +1696,39 @@ def run_agent_loop(*, config: AgentRunConfig, task: str) -> AgentOutcome:
     # while sparse; deterministic (sorted def-name intersection), no extra LLM pass.
     keywords_enrichable = len(task_keywords) < 8
     write_deadline_fired = False
+    _context_evicted = False
 
     for step in range(1, max(1, config.max_steps) + 1):
         if 0 < config.wall_clock_limit <= time.monotonic() - started:
             exit_status = "TimeExceeded"
             message = f"wall clock limit of {config.wall_clock_limit:.0f}s reached"
             break
+        # EPHEMERAL GRAFT (genuine core-solve lever): the rich localizer's +5000-char
+        # <context> block lives in pinned messages[1] and is re-sent EVERY step (token
+        # tax) -> step-starvation that both times the model out and collapses STRONG
+        # rounds 0.70->0.20. Once the model has made its FIRST edit, the localizer has
+        # served its purpose (and is now STALE -- it shows pre-edit source); excise it so
+        # the freed per-step budget goes to SOLVING/refinement against the live worktree.
+        # Rich rounds only; deterministic (fires at the first non-empty diff). The model
+        # can re-read any file on disk if it needs it again.
+        if (
+            _rich_active
+            and not _context_evicted
+            and len(messages) > 1
+            and collect_repo_patch(config.repo_dir).strip()
+        ):
+            _c1 = str(messages[1].get("content") or "")
+            _i, _j = _c1.find("<context>"), _c1.find("</context>")
+            if _i != -1 and _j != -1 and _j > _i:
+                messages[1] = {
+                    **messages[1],
+                    "content": _c1[:_i]
+                    + "[localization context omitted to conserve budget -- the relevant "
+                    "files are already in the repository; read them directly if needed]"
+                    + _c1[_j + len("</context>"):],
+                }
+                _context_evicted = True
+                log_lines.append(f"[step {step}] rich graft evicted (first edit made)")
         if keywords_enrichable:
             observed = "\n".join(
                 str(m.get("content") or "")
@@ -1766,12 +1804,22 @@ def run_agent_loop(*, config: AgentRunConfig, task: str) -> AgentOutcome:
         messages.append({"role": "user", "content": observation})
         if (
             not write_deadline_fired
-            and step >= _WRITE_DEADLINE_STEP
+            and (
+                step >= _WRITE_DEADLINE_STEP
+                or (
+                    _rich_active
+                    and config.wall_clock_limit > 0
+                    and (time.monotonic() - started)
+                    >= _RICH_WRITE_DEADLINE_FRACTION * config.wall_clock_limit
+                )
+            )
             and not collect_repo_patch(config.repo_dir).strip()
         ):
             write_deadline_fired = True
             messages.append({"role": "user", "content": _write_deadline_message(step)})
-            log_lines.append(f"[step {step}] write deadline fired (empty patch)")
+            log_lines.append(
+                f"[step {step}] write deadline fired (empty patch, rich={_rich_active})"
+            )
     patch = collect_repo_patch(config.repo_dir)
     logs = truncate_text("\n".join(log_lines), config.max_log_chars)
     return AgentOutcome(
@@ -1959,6 +2007,24 @@ COMPAREPATCH_MIN_REMAINING_SECONDS = 100.0
 COMPARECOMPARE_RESERVE_SECONDS = 20.0
 COMPAREPATCH_APPLY_RESERVE_SECONDS = 10.0
 COMPAREPATCH_MIN_MAIN_SECONDS = 45.0
+# MARGIN-GATE (beater): the LLM patch-judge already emits candidate_a/b_score but
+# the king (chal35) THROWS THEM AWAY and flips to B on a bare winner letter. The
+# judge is noisy (~5pt), so on two genuinely-different GOOD patches it coin-flips
+# and can DOWNGRADE an already-winning attempt-1 (the source of chal35's STRONG -3
+# / 8-of-39 non-timeout losses). We require B to beat A by a DECISIVE margin on the
+# judge's OWN scores before it may replace attempt-1; otherwise keep the incumbent
+# attempt-1. Pure do-no-harm at the OUTPUT (never touches the GENERATOR / the
+# second-attempt rider that produces the BIG wins): only converts bad B-flips back
+# to A-keeps, leaving every decisive-B win (gap >> margin) untouched.
+COMPARE_FLIP_MARGIN = 8.0
+# CLEAN-HEDGE bucket-conditional margin: A = clean attempt-1, B = graft attempt-2.
+# On STRONG rounds the clean A scores high (a_score >> 34) -> keep the STRICT 8.0 so a
+# noisy judge can't flip the (recovered) clean winner to the saboteur graft B. On WHIFF
+# rounds the clean A flounders (a_score <= 34) -> lower the bar so the graft B (which
+# localizes the owning code) flips in and preserves the +21 WHIFF edge. The a_score<=34
+# guard DECOUPLES the two buckets through one gate -> STRONG recovery AND WHIFF edge.
+WHIFF_FLIP_THRESHOLD = 34.0   # a_score <= this == clean A floundered (WHIFF bucket)
+WHIFF_FLIP_MARGIN = 4.0       # graft B needs only a small (>judge-noise) edge to flip in
 
 
 def _global_remaining_seconds(started: float) -> float:
@@ -2181,6 +2247,279 @@ def _read_repo_file(repo_dir: str, path: str) -> Optional[str]:
             return fh.read()
     except OSError:
         return None
+
+
+_PRELOAD_MAX_CHARS = 12000  # cap on the issue-ranked content preload for attempt 1
+
+
+def _issue_ranked_context(issue_text: str, repo_dir: str) -> str:
+    """ISSUE-RANKED CONTENT PRELOAD for attempt-1 (chal35 passes "" here -- it has
+    repo_summary's blind tree but ZERO attempt-1 file CONTENT and no issue->file
+    ranking). For each file the issue EXPLICITLY NAMES that EXISTS on disk, inject its
+    current content so attempt-1 starts with the owning code in view -- saving the
+    localization steps a weak solver burns and reproducing a stronger solver's edge.
+    HIGH-PRECISION + DO-NO-HARM: only the files the issue literally names (via the
+    king's own _FILE_IN_ISSUE_RE) that resolve on disk; returns "" when none ->
+    byte-identical to chal35, so it NEVER anchors on an ambiguous guess. Even if a
+    named file is a red herring, attempt-2 (clean tree) + the margin-gate are the
+    fallbacks. Deterministic; no LLM call."""
+    if not (issue_text or "").strip():
+        return ""
+    named: list = []
+    for m in _FILE_IN_ISSUE_RE.finditer(issue_text):
+        p = m.group(1).strip().lstrip("./")
+        if p and p not in named and os.path.isfile(os.path.join(repo_dir, p)):
+            named.append(p)
+        if len(named) >= 3:
+            break
+    if not named:
+        return ""
+    blocks: list = []
+    used = 0
+    for p in named:
+        content = _read_repo_file(repo_dir, p)
+        if not content:
+            continue
+        budget = _PRELOAD_MAX_CHARS - used
+        if budget <= 200:
+            break
+        if len(content) > budget:
+            content = content[:budget] + "\n... (truncated)"
+        blocks.append(
+            f"-----\nFILE NAME: {p}\nNOTE: current on-disk content of a file the task "
+            f"NAMES; use it directly -- do not re-read this file unless you edit it.\n"
+            f"FILE CONTENT:\n```\n{content}\n```\n-----"
+        )
+        used += len(content)
+    return "\n".join(blocks)
+
+
+# ===================== GENUINE CORE-SOLVE LEVER: rich symbol localizer =====================
+# chal35 hands the weak Qwen3-32B a BLIND repo path tree + empty attempt-1 context, so the
+# model burns read-budget grepping for the owning code instead of solving. _localize_rich
+# extracts the ACTUAL SOURCE of the issue's named symbols/functions/classes (+ named-file
+# heads) deterministically, so attempt-1 starts with the right code in view. Grafted verbatim
+# from auto/rich_localize.py (only os/re deps, both already imported above). Fail-open to "".
+_RICH_MAX_CHARS = 6500
+_RICH_MAX_REGIONS = 6
+_RICH_BLOCK_LINES = 90
+_RICH_MAX_FILES = 2500
+_RICH_SKIP_DIRS = frozenset({".git","node_modules","vendor","dist","build","__pycache__",".venv",
+    "venv","target",".next","coverage",".tox",".mypy_cache",".pytest_cache","site-packages",".idea",".gradle"})
+_RICH_CODE_EXT = (".py",".ts",".tsx",".js",".jsx",".mjs",".cjs",".go",".rs",".java",".cs",".rb",
+    ".php",".vue",".svelte",".c",".cc",".cpp",".cxx",".h",".hpp",".kt",".swift",".scala")
+_RICH_IDENT_RE = re.compile(r"`([A-Za-z_][A-Za-z0-9_./]{2,60})`")
+_RICH_TB_RE = re.compile(r'File "([^"]+\.[A-Za-z]{1,4})", line \d+, in (\w+)')
+_RICH_FILE_RE = re.compile(r"`?([A-Za-z0-9_./-]+\.[A-Za-z]{1,5})`?")
+_RICH_GENERIC = frozenset({"self","this","true","false","none","null","return","import","from",
+    "value","values","result","error","data","test","tests","type","class","object","string",
+    "number","list","dict","when","then","should","add","fix","update","the","and","for","with",
+    "http","https","html","json","api","url","function","method","issue","bug","feature","file",
+    "files","code","field","config","option","default","input","output","request","response"})
+
+
+def _rich_symbols(issue):
+    out, seen = [], set()
+    def add(s):
+        if s and s.lower() not in _RICH_GENERIC and s not in seen:
+            seen.add(s); out.append(s)
+    for m in _RICH_IDENT_RE.finditer(issue or ""):
+        s = m.group(1)
+        if s.endswith(_RICH_CODE_EXT):
+            continue
+        add(re.split(r"[./]", s)[-1])
+    for m in _RICH_TB_RE.finditer(issue or ""):
+        add(m.group(2))
+    for m in re.finditer(r"\b([A-Z][a-zA-Z0-9]{3,}|[a-z_][a-z0-9_]*_[a-z0-9_]+)\b", issue or ""):
+        add(m.group(1))
+    return out[:10]
+
+
+def _rich_named_files(issue):
+    out = []
+    for m in _RICH_FILE_RE.finditer(issue or ""):
+        p = m.group(1).strip().lstrip("./")
+        if p and "." in p and p not in out and not p.endswith((".com",".org",".net",".io")):
+            out.append(p)
+    return out[:6]
+
+
+def _rich_walk(repo_path):
+    files = []
+    for root, dirs, names in os.walk(repo_path):
+        dirs[:] = sorted(d for d in dirs if d not in _RICH_SKIP_DIRS)
+        for n in sorted(names):
+            if n.endswith(_RICH_CODE_EXT):
+                files.append(os.path.relpath(os.path.join(root, n), repo_path))
+                if len(files) >= _RICH_MAX_FILES:
+                    return sorted(files)
+    return sorted(files)
+
+
+def _rich_defline_re(sym):
+    s = re.escape(sym)
+    return re.compile(
+        r"(?:^|[^A-Za-z0-9_])(?:def|class|function|func|fn|interface|type|struct|impl|enum)\s+" + s + r"\b"
+        r"|(?:export\s+)?(?:async\s+)?(?:function\s+" + s + r"\b)"
+        r"|(?:export\s+)?(?:const|let|var)\s+" + s + r"\s*[:=]"
+        r"|^\s*" + s + r"\s*[:(]"
+    )
+
+
+def _rich_block(lines, i, ext):
+    """Extract the def-block starting at physical index i, bounded to _RICH_BLOCK_LINES.
+    .py: until a non-blank line at indent <= the def-line indent. c-family: brace balance."""
+    n = len(lines)
+    end = min(i + _RICH_BLOCK_LINES, n)
+    if ext == ".py":
+        base = len(lines[i]) - len(lines[i].lstrip())
+        paren = lines[i].count("(") - lines[i].count(")")
+        header_done = paren <= 0 and lines[i].rstrip().endswith(":")
+        j = i + 1
+        while j < end:
+            ln = lines[j]
+            paren += ln.count("(") - ln.count(")")
+            if not header_done:                       # still inside a multi-line def signature
+                if paren <= 0 and ln.rstrip().endswith(":"):
+                    header_done = True
+                j += 1
+                continue
+            if ln.strip() and (len(ln) - len(ln.lstrip())) <= base:
+                break                                  # dedent to <= def level ends the body
+            j += 1
+        return lines[i:j]
+    # brace-based (c-family / js / ts / etc.)
+    depth = 0
+    seen_open = False
+    j = i
+    while j < end:
+        depth += lines[j].count("{") - lines[j].count("}")
+        if "{" in lines[j]:
+            seen_open = True
+        if seen_open and depth <= 0 and j > i:
+            j += 1
+            break
+        j += 1
+    return lines[i:j]
+
+
+def _localize_rich(repo_path, issue):
+    try:
+        if not repo_path or not os.path.isdir(repo_path):
+            return ""
+        symbols = _rich_symbols(issue)
+        named = _rich_named_files(issue)
+        if not symbols and not named:
+            return ""
+        files = _rich_walk(repo_path)
+        if not files:
+            return ""
+        bybase = {}
+        for f in files:
+            bybase.setdefault(os.path.basename(f), []).append(f)
+        regions = []      # (rel, lineno, "\n".join(block))
+        seen_keys = set()
+        # symbol def-sites -> full enclosing block
+        for sym in symbols:
+            if len(regions) >= _RICH_MAX_REGIONS:
+                break
+            dre = _rich_defline_re(sym)
+            found = 0
+            for rel in files:
+                if found >= 1 or len(regions) >= _RICH_MAX_REGIONS:
+                    break
+                ext = os.path.splitext(rel)[1]
+                try:
+                    with open(os.path.join(repo_path, rel), "r", errors="ignore") as fh:
+                        lines = fh.read().splitlines()
+                except (OSError, UnicodeError):
+                    continue
+                for idx, ln in enumerate(lines):
+                    if idx > 6000:
+                        break
+                    if dre.search(ln):
+                        block = _rich_block(lines, idx, ext)
+                        body = "\n".join(block).rstrip()
+                        if not body.strip():
+                            continue
+                        key = (rel, idx)
+                        if key in seen_keys:
+                            continue
+                        seen_keys.add(key)
+                        regions.append((rel, idx + 1, body))
+                        found += 1
+                        break
+        # named files with no symbol hit -> include head
+        if len(regions) < _RICH_MAX_REGIONS:
+            for nm in named:
+                if len(regions) >= _RICH_MAX_REGIONS:
+                    break
+                base = os.path.basename(nm)
+                cand = nm if nm in files else (bybase.get(base, [None])[0])
+                if not cand or any(r[0] == cand for r in regions):
+                    continue
+                try:
+                    with open(os.path.join(repo_path, cand), "r", errors="ignore") as fh:
+                        head = "\n".join(fh.read().splitlines()[:60]).rstrip()
+                except (OSError, UnicodeError):
+                    continue
+                if head.strip():
+                    regions.append((cand, 1, head))
+        if not regions:
+            return ""
+        out = ["RELEVANT CURRENT SOURCE (read-only reference -- the issue's named symbols and their "
+               "definitions are below so you can implement the COMPLETE fix immediately by EDITING "
+               "these in the repo; you do not need to re-grep/re-read them; verify the enclosing "
+               "context before editing):"]
+        total = len(out[0])
+        for rel, ln, body in regions:
+            hdr = f"\n----- {rel}:{ln} -----"
+            piece = hdr + "\n" + body
+            if total + len(piece) > _RICH_MAX_CHARS:
+                # truncate this region to fit, then stop
+                room = _RICH_MAX_CHARS - total - len(hdr) - 20
+                if room > 200:
+                    out.append(hdr + "\n" + body[:room] + "\n... (truncated)")
+                break
+            out.append(piece)
+            total += len(piece)
+        return "\n".join(out)[:_RICH_MAX_CHARS]
+    except Exception:
+        return ""
+
+
+_RICH_GRAFT_MAX_CHARS = 5000  # cap on grafted symbol-block context (< _RICH_MAX_CHARS=6500)
+
+
+def _cleanhedge_graft(issue_text: str, repo_dir: str) -> str:
+    """The rich symbol graft for the DIVERGENT attempt-2 (clean-hedge). Fail-open to ''
+    so attempt-2 falls back to its plain no-graft divergence on any error."""
+    try:
+        return _localize_rich(repo_dir, issue_text)[:_RICH_GRAFT_MAX_CHARS]
+    except Exception:
+        return ""
+
+
+def _combined_preload_context(issue_text: str, repo_dir: str) -> str:
+    """Attempt-1 preload (DO-NO-HARM, FILL-ONLY). PRIMARY = combo's named-file
+    whole-content preloader (_issue_ranked_context, high precision). ONLY when the
+    issue NAMES NO on-disk file (ranked == "") does the symbol->def-block rich
+    localizer fire, to fill the gap where attempt-1 would otherwise fly BLIND (zero
+    context) -- exactly the LOW-COVERAGE / timeout-while-localizing rounds the duel
+    forensics flagged. When a named-file anchor already exists we return it UNCHANGED
+    (never dilute a precise anchor with extra symbol blocks -> protects the rounds
+    combo already wins). Deterministic (retest-reproducible); fail-open to "". When
+    BOTH are "" (no named file, no symbol) the prompt is BYTE-IDENTICAL to chal35."""
+    try:
+        ranked = _issue_ranked_context(issue_text, repo_dir)
+    except Exception:
+        ranked = ""
+    if ranked:
+        return ranked
+    try:
+        return _localize_rich(repo_dir, issue_text)[:_RICH_GRAFT_MAX_CHARS]
+    except Exception:
+        return ""
 
 
 def _format_patch_file_entry(entry: _PatchFileEntry, *, from_reset: bool = True) -> str:
@@ -2535,6 +2874,37 @@ def _parse_COMPAREpatch_judge_reply(text: str) -> str:
     return "B" if letter == "B" else "A"
 
 
+def _parse_COMPAREpatch_judge_scored(text: str):
+    """Like _parse_COMPAREpatch_judge_reply but ALSO returns the judge's OWN scores:
+    (letter, a_score, b_score). Scores are None on any path that cannot recover them
+    (regex/bare-letter fallback) so the caller falls back to bare-letter behaviour and
+    never regresses the parse path. Reuses the king's _extract_json_object/
+    _normalize_judge_winner/_WINNER_JSON_RE/_parse_patch_choice verbatim."""
+    raw = text or ""
+    payload = _extract_json_object(raw)
+    if payload is not None:
+        winner = _normalize_judge_winner(str(payload.get("winner", "")))
+
+        def _num(v):
+            try:
+                return float(v)
+            except (TypeError, ValueError):
+                return None
+
+        a = _num(payload.get("candidate_a_score"))
+        b = _num(payload.get("candidate_b_score"))
+        return ("B" if winner == "candidate_b" else "A"), a, b
+    match = _WINNER_JSON_RE.search(_strip_markdown_fences(raw))
+    if match:
+        winner = _normalize_judge_winner(match.group(1))
+        if winner == "candidate_b":
+            return "B", None, None
+        if winner == "candidate_a":
+            return "A", None, None
+    letter = _parse_patch_choice(raw)
+    return ("B" if letter == "B" else "A"), None, None
+
+
 def _COMPARE_heuristic(patch_a: str, patch_b: str) -> Optional[str]:
     """Return 'A' or 'B' when one patch is clearly better, else None for LLM."""
     a_ok = bool(patch_a.strip()) and patch_acceptable(patch_a)
@@ -2598,7 +2968,23 @@ def _compare_patches_with_llm(
         reply = model.query([{"role": "user", "content": prompt}])
     except ModelQueryError:
         return "A"
-    return _parse_COMPAREpatch_judge_reply(reply)
+    # MARGIN-GATE: adopt B only on DECISIVE judge evidence (b - a >= margin), else
+    # keep the incumbent attempt-1 (A). Preserves the king's fail-open-to-A bias but
+    # raises the bar for the noisy judge to FLIP a winning A to a worse B.
+    letter, a_score, b_score = _parse_COMPAREpatch_judge_scored(reply)
+    if letter != "B":
+        return "A"
+    if a_score is None or b_score is None:
+        return "B"  # scores unrecoverable -> king's original bare-letter behaviour
+    # CLEAN-HEDGE EDIT 3: bucket-conditional flip margin. STRONG (clean A high) keeps the
+    # strict 8.0 to protect the recovered clean winner; WHIFF (clean A floundered) lowers
+    # the bar so the graft B flips in and preserves the +21 WHIFF edge.
+    margin = (
+        WHIFF_FLIP_MARGIN
+        if a_score <= WHIFF_FLIP_THRESHOLD
+        else COMPARE_FLIP_MARGIN
+    )
+    return "B" if (b_score - a_score) >= margin else "A"
 
 
 def _restore_worktree_patch(repo_dir: str, patch_text: str) -> bool:
@@ -4604,7 +4990,14 @@ def solve(
             command_timeout=command_timeout,
             max_tokens=max_tokens,
             started=started,
-            main_task=build_initial_user_prompt(issue, repo_summary, ""),
+            # CLEAN-HEDGE EDIT 1: attempt-1 is the CLEAN full-budget solve. Use combo's
+            # high-precision named-file preloader (the exact config that measured STRONG
+            # coverage 0.753 ~= king) -- NOT _combined_preload_context, which on no-named-
+            # file tasks fires _localize_rich (the symbol graft PROVEN to crater STRONG
+            # 0.753->0.586, p=0.0025). The saboteur graft moves to the divergent attempt-2.
+            main_task=build_initial_user_prompt(
+                issue, repo_summary, _issue_ranked_context(issue, repo_path)
+            ),
         )
         outcome = first_pipeline.outcome
         repair_note = first_pipeline.repair_note
@@ -4642,8 +5035,13 @@ def solve(
                             command_timeout=command_timeout,
                             max_tokens=max_tokens,
                             started=started,
+                            # CLEAN-HEDGE EDIT 2: the rich symbol graft (_localize_rich)
+                            # rides the DIVERGENT attempt-2 -- it keeps the +21 WHIFF
+                            # localization edge while keeping attempt-1 clean for STRONG.
+                            # Pure local os.walk+regex (no solve-budget cost); fail-open "".
                             main_task=build_second_attempt_prompt(
-                                issue, repo_summary, first_patch, context_files, "",
+                                issue, repo_summary, first_patch, context_files,
+                                _cleanhedge_graft(issue, repo_path),
                             ),
                             main_wall_clock_limit=creation_budget,
                             post_pass_reserve=post_reserve,
@@ -4672,6 +5070,18 @@ def solve(
                                 patch_a=first_patch,
                                 patch_b=second_patch,
                             )
+                            # VERIFY-THE-WINNER: never let the judge ship a
+                            # syntactically-broken B over a clean A. The worktree
+                            # holds the SECOND patch on disk now, so _syntax_errors
+                            # checks B directly; patch_acceptable is a pure check on
+                            # A. Pure do-no-harm: only fires when B is verifiably
+                            # broken and A is acceptable.
+                            if (
+                                choice == "B"
+                                and _syntax_errors(repo_path, second_patch)
+                                and patch_acceptable(first_patch)
+                            ):
+                                choice = "A"
                             winning_patch = first_patch if choice == "A" else second_patch
                             ensemble_note = f" (dual-patch: chose {choice})"
                             if choice == "B":
