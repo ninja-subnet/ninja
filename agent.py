@@ -6045,6 +6045,21 @@ def solve(
                                 and patch_acceptable(first_patch)
                             ):
                                 choice = "A"
+                            elif (
+                                choice == "A"
+                                and patch_acceptable(second_patch)
+                                and not _syntax_errors(repo_path, second_patch)
+                            ):
+                                # Symmetrically verify choice A. The worktree holds the SECOND patch (B) on disk now,
+                                # so we restore the first patch (A) temporarily to check its syntax using _syntax_errors.
+                                # If A is indeed broken, we flip the choice to B and restore the second patch back.
+                                if _restore_worktree_patch(repo_path, first_patch):
+                                    if _syntax_errors(repo_path, first_patch):
+                                        choice = "B"
+                                        _restore_worktree_patch(repo_path, second_patch)
+                                    else:
+                                        _restore_worktree_patch(repo_path, second_patch)
+
                             winning_patch = first_patch if choice == "A" else second_patch
                             ensemble_note = f" (dual-patch: chose {choice})"
                             if choice == "B":
