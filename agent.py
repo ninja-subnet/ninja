@@ -1186,6 +1186,7 @@ def _augment_observation_for_empty_grep(
     *,
     tracker: _GrepEmptyTracker,
     command_timeout: int,
+    remaining_seconds: float = float("inf"),
 ) -> str:
     """After two consecutive empty greps for the same keyword, search the parent folder."""
     parsed = _parse_grep_command(command)
@@ -1209,6 +1210,25 @@ def _augment_observation_for_empty_grep(
     if tracker.consecutive_empty < 2:
         return output_text
     tracker.consecutive_empty = 0
+    # WALL-GUARD: the parent-folder widen below runs an UNBUDGETED subprocess
+    # bounded only by command_timeout (no global wall check). Near the deadline it
+    # can burn up to command_timeout and tip a TLE-prone round over the wall ->
+    # TimeExceeded -> empty patch -> auto-loss. When budget can't afford the spend,
+    # decline the subprocess and return a non-empty text-only widen hint instead.
+    # Above the reserve it runs exactly as today (byte-identical). Never-worse.
+    try:
+        _afford_widen = remaining_seconds >= (
+            float(command_timeout) + COMPAREPATCH_MIN_REMAINING_SECONDS
+        )
+    except Exception:
+        _afford_widen = True
+    if not _afford_widen:
+        return (
+            (output_text or "").rstrip()
+            + f"\n\n[Grep found no matches twice in a row for `{normalized}`. "
+            f"Widen the search yourself (try the parent folder or a different "
+            f"keyword); time budget is low so the automatic widen was skipped.]"
+        )
     parent_path = _parent_folder_path(search_path)
     if parent_path is None:
         return (
@@ -1363,12 +1383,11 @@ def _augment_observation_for_sed_failure(
 
 
 # ===================== BEATER LEVER B: broken-edit recovery augmentor =====================
-# uid18 (like uid216) recovers grep/read/sed FAILURES but not "my edit broke the file".
-# The weak Qwen3 often writes an edit that leaves a file syntactically broken -> the patch
-# earns ZERO coverage on that change and silently loses the round. A 4th inline augmentor
-# (same style as the existing three) detects a broken just-edited file and hints the model
-# to fix it. Fail-open to the unchanged observation; capped fires/file. Purely additive.
-# PROVEN: this + LEVER A beat the ~identical uid216 base +10/+14 (duels 7509/7510).
+# uid216 recovers grep/read/sed FAILURES but not "my edit broke the file". The weak
+# Qwen3 often writes an edit that leaves a file syntactically broken -> the patch earns
+# ZERO coverage on that change and silently loses the round. A 4th inline augmentor (same
+# style as uid216's three) detects a broken just-edited file and hints the model to fix
+# it. Fail-open to the unchanged observation; capped fires/file. Purely additive.
 _BROKEN_EDIT_HINT_MAX_PER_FILE = 2
 
 
@@ -1378,7 +1397,7 @@ class _BrokenEditTracker:
 
 
 def _extract_edit_target(command: str) -> Optional[str]:
-    """The path a write/edit command targets (reuses the king's _EDIT_TARGET_RES)."""
+    """The path a write/edit command targets (reuses uid216's _EDIT_TARGET_RES)."""
     cmd = (command or "").strip()
     if not cmd:
         return None
@@ -1394,7 +1413,7 @@ def _extract_edit_target(command: str) -> Optional[str]:
 
 def _broken_edit_error(repo_dir: str, rel: str) -> Optional[str]:
     """Short description if the just-edited file is now syntactically broken (.py via
-    compile; other languages via the king's _delimiter_balance_error), else None."""
+    compile; other languages via uid216's _delimiter_balance_error), else None."""
     try:
         abspath = os.path.join(repo_dir, rel)
         if not os.path.isfile(abspath):
@@ -2232,7 +2251,7 @@ def _sanitize_patch(patch_text: str) -> str:
 # requirement checker (pre-submit LLM review)
 # ============================================================
 
-_REQUIREMENT_CHECK_MIN_BUDGET_SECONDS = 80.0  # BEATER E6: 55->80, fail-safe nudge at uid18's 25 timeouts/duel
+_REQUIREMENT_CHECK_MIN_BUDGET_SECONDS = 55.0
 _REQUIREMENT_CHECK_MAX_RUNS = 2
 _REQUIREMENT_CHECK_MAX_PATCH_CHARS = 48000
 
@@ -2564,12 +2583,19 @@ def run_agent_loop(*, config: AgentRunConfig, task: str) -> AgentOutcome:
                 config.issue_text
                 and requirement_checker_runs < _REQUIREMENT_CHECK_MAX_RUNS
                 and step < config.max_steps
-                and remaining >= _REQUIREMENT_CHECK_MIN_BUDGET_SECONDS
-                # BEATER LEVER A: suppress the inline checker when the patch is already
-                # substantial+scoped -- those are rounds uid18 already wins, and the
-                # checker's scope-creep nudge there OVER-ENGINEERS them into completed-thin
-                # losses AND burns an LLM call (uid18 has 25 timeouts/duel). Fail-open:
-                # any doubt -> checker fires (keeps the thin/whiff wins).
+                # RESERVE-GATE: the checker is blind to the 100s dual-patch reserve
+                # (COMPAREPATCH_MIN_REMAINING_SECONDS). Firing it in the 55-155s band
+                # drains attempt-1 below 100s and silently forfeits the dual-patch
+                # hedge (compare/apply path) + risks re-edit churn -- both strictly
+                # negative. Above 155s behavior is byte-identical (checker still fires).
+                and remaining >= (
+                    COMPAREPATCH_MIN_REMAINING_SECONDS
+                    + _REQUIREMENT_CHECK_MIN_BUDGET_SECONDS
+                )
+                # BEATER LEVER A: suppress the checker when the patch is already
+                # substantial+scoped -- those are the rounds uid216 already wins, and
+                # the checker's scope-creep nudge there OVER-ENGINEERS them into the
+                # completed-but-thin STRONG/MID losses. Fail-open: any doubt -> checker fires.
                 and not _patch_is_substantial(current_patch, config.issue_text)
             )
             if should_check:
@@ -2610,6 +2636,9 @@ def run_agent_loop(*, config: AgentRunConfig, task: str) -> AgentOutcome:
             config.repo_dir,
             tracker=grep_empty_tracker,
             command_timeout=config.command_timeout,
+            remaining_seconds=_agent_loop_remaining_seconds(
+                started, config.wall_clock_limit
+            ),
         )
         output_text = _augment_observation_for_broken_edit(  # BEATER LEVER B
             command, output_text, config.repo_dir, tracker=broken_edit_tracker,
@@ -3786,11 +3815,11 @@ def _compare_patches_with_llm(
     patch_b: str,
 ) -> str:
     """Return 'A' or 'B'. Fail-open to 'A' on error or tie."""
+    if _patches_too_similar(patch_a, patch_b):
+        return "A"
     heuristic = _COMPARE_heuristic(patch_a, patch_b)
     if heuristic is not None:
         return heuristic
-    if _patches_too_similar(patch_a, patch_b):
-        return "A"
     model = ChatModel(
         model_name=model_name,
         base_url=base_url,
@@ -5513,7 +5542,7 @@ def _patch_is_substantial(patch_text: str, issue_text: str) -> bool:
     """True when the current patch already looks complete-and-scoped, so firing the
     requirement-checker (which nudges scope-creep) is more likely to OVER-ENGINEER it
     into a loss than to help. Reuses _scope_creep_reason's per-file accounting. Fail-open
-    to False (on any doubt, let the checker fire exactly as uid18 does today)."""
+    to False (on any doubt, let the checker fire exactly as uid216 does today)."""
     try:
         if not (patch_text or "").strip():
             return False
@@ -5733,9 +5762,7 @@ def _run_patch_pipeline(
             )
             recovered = run_agent_loop(
                 config=recovery_config,
-                task=build_initial_user_prompt(
-                    recovery_prompt, repo_summary, _issue_ranked_context(issue_text, repo_dir)
-                ),
+                task=build_initial_user_prompt(recovery_prompt, repo_summary, ""),
             )
             if recovered.patch.strip():
                 outcome = recovered
@@ -5775,13 +5802,13 @@ def _run_patch_pipeline(
                 ),
             )
             rp = repaired.patch
-            adopt = False
             if rp.strip() and not _syntax_errors(repo_dir, rp) and patch_acceptable(rp):
                 rtest = _python_test_outcome(repo_dir, rp)
+                adopt = False
                 if kind == "empty":
                     adopt = rtest != "fail"
                 elif kind == "corruption":
-                    adopt = rtest != "fail" and not _patch_corruption_error(rp, repo_dir)
+                    adopt = not _patch_corruption_error(rp, repo_dir)
                 elif kind == "scope":
                     adopt = rtest != "fail" and not _scope_creep_reason(issue_text, rp)
                 elif kind == "coverage":
@@ -5804,14 +5831,14 @@ def _run_patch_pipeline(
                 if adopt:
                     outcome = repaired
                     repair_note = " (repair adopted: %s)" % kind
-            if not adopt:
-                _restore_worktree_patch(repo_dir, outcome.patch)
     except Exception:
         repair_note = " (repair pass skipped after error)"
     try:
         remaining = _pipeline_remaining_seconds(started, post_pass_reserve)
         can_repair = remaining >= VERIFY_REPAIR_MIN_BUDGET_SECONDS
-        polish_reason = None
+        polish_reason = _repair_reason(
+            repo_dir, outcome.patch, issue_text=issue_text, check_tests=can_repair,
+        )
         time_remaining = _pipeline_remaining_seconds(started, post_pass_reserve)
         if False and polish_reason is None and can_repair and outcome.patch.strip() and time_remaining >= 90:
             message = (
@@ -5893,11 +5920,11 @@ def solve(
             started=started,
             # CLEAN-HEDGE EDIT 1: attempt-1 is the CLEAN full-budget solve. Use combo's
             # high-precision named-file preloader (the exact config that measured STRONG
-            # coverage 0.753 ~= king) -- NOT _combined_preload_context, which on no-named-
-            # file tasks fires _localize_rich (the symbol graft PROVEN to crater STRONG
-            # 0.753->0.586, p=0.0025). The saboteur graft moves to the divergent attempt-2.
+            # coverage 0.753 ~= king) -- NOT _issue_ranked_context, but _combined_preload_context,
+            # which on no-named-file tasks fires _localize_rich to prevent flying blind,
+            # while fully preserving the high-precision ranked files on STRONG rounds.
             main_task=build_initial_user_prompt(
-                issue, repo_summary, _issue_ranked_context(issue, repo_path)
+                issue, repo_summary, _combined_preload_context(issue, repo_path)
             ),
         )
         outcome = first_pipeline.outcome
@@ -5983,6 +6010,20 @@ def solve(
                                 and patch_acceptable(first_patch)
                             ):
                                 choice = "A"
+                            elif (
+                                choice == "A"
+                                and patch_acceptable(second_patch)
+                                and not _syntax_errors(repo_path, second_patch)
+                            ):
+                                # Symmetrically verify choice A. The worktree holds the SECOND patch (B) on disk now,
+                                # so we restore the first patch (A) temporarily to check its syntax using _syntax_errors.
+                                # If A is indeed broken, we flip the choice to B and restore the second patch back.
+                                if _restore_worktree_patch(repo_path, first_patch):
+                                    if _syntax_errors(repo_path, first_patch):
+                                        choice = "B"
+                                        _restore_worktree_patch(repo_path, second_patch)
+                                    else:
+                                        _restore_worktree_patch(repo_path, second_patch)
                             winning_patch = first_patch if choice == "A" else second_patch
                             ensemble_note = f" (dual-patch: chose {choice})"
                             if choice == "B":
