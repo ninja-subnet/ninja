@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
 import subprocess
 import time
 import traceback
@@ -61,6 +62,7 @@ import line when that module is already imported -- never add duplicate or repea
 imports for the same symbol.
 Before submitting: re-read every edited region to confirm correctness and no unrelated edits; verify syntax (`python3 -m py_compile` for Python, `node --check` for JS/TS).
 Output only valid source: no stray leading `n` from a broken newline, no literal `$1`/`$2` sed backreference, no duplicated function/method, no blank-line padding, no file-mode changes, and no backup/original copies (edit the real file in place).
+Do not use sed -i when the old or new text contains quotes, HTML, pipes, backslashes, or semicolons -- read the file, then rewrite it with `cat <<'EOF' > path`.
 """
 TASK_TEMPLATE = """\
 {repo_section}Please solve this issue:
@@ -68,7 +70,6 @@ TASK_TEMPLATE = """\
 <task>
 {task_text}
 </task>
-{extra_context}
 {extra_context}
 Deliver a change a senior maintainer would merge without edits: make the
 required behavior actually true, and make the fix correct, COMPLETE, and clean.
@@ -822,23 +823,29 @@ _QUIET_TOOL_DEFAULTS = {
     "PYTHONDONTWRITEBYTECODE": "1",
 }
 
+# Evaluation runs on Ubuntu/Linux: use bash so heredocs, sed, and other
+# prompt-directed bash syntax match the shell the model is told to emit.
+_BASH_EXECUTABLE = "/bin/bash" if os.path.isfile("/bin/bash") else None
+
 
 def execute_command(command: str, *, cwd: str, timeout: int) -> dict:
     env = os.environ.copy()
     env.update(_QUIET_TOOL_DEFAULTS)
+    run_kwargs: dict = {
+        "shell": True,
+        "cwd": cwd,
+        "env": env,
+        "text": True,
+        "encoding": "utf-8",
+        "errors": "replace",
+        "timeout": max(1, int(timeout)),
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.STDOUT,
+    }
+    if _BASH_EXECUTABLE:
+        run_kwargs["executable"] = _BASH_EXECUTABLE
     try:
-        completed = subprocess.run(
-            command,
-            shell=True,
-            cwd=cwd,
-            env=env,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=max(1, int(timeout)),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-        )
+        completed = subprocess.run(command, **run_kwargs)
         return {"output": completed.stdout or "", "returncode": completed.returncode}
     except subprocess.TimeoutExpired as exc:
         partial = exc.output or ""
@@ -850,6 +857,509 @@ def execute_command(command: str, *, cwd: str, timeout: int) -> dict:
         }
     except (OSError, ValueError) as exc:
         return {"output": f"[command could not be executed: {exc}]", "returncode": -1}
+
+
+_READ_TARGET_RES = (
+    re.compile(r"^cat\s+(?:-[a-zA-Z]+\s+)*(['\"]?)([\w./~-]+)\1"),
+    re.compile(r"^(?:head|tail|nl|less|more|wc)\s+(?:-[a-zA-Z0-9]+\s+)*(['\"]?)([\w./~-]+)\1"),
+)
+_WRITE_HEREDOC_RE = re.compile(r"\bcat\s+<<", re.I)
+_WRITE_UTIL_RE = re.compile(
+    r"^(?:tee|touch|sed|mv|cp|install|truncate|python3?)\b",
+    re.I,
+)
+_WRITE_SED_INPLACE_RE = re.compile(r"\bsed\s+-i", re.I)
+_MISSING_FILE_OUT_RE = re.compile(
+    r"(?:No such file|ENOENT|can't open|cannot open|not found)",
+    re.I,
+)
+_MISSING_FILE_BASENAME_HINT_LIMIT = 25
+
+
+def _is_write_only_command(command: str) -> bool:
+    """True when the command writes/creates files rather than reading one."""
+    cmd = (command or "").strip()
+    if not cmd:
+        return False
+    if _WRITE_HEREDOC_RE.search(cmd):
+        return True
+    if _WRITE_UTIL_RE.match(cmd):
+        return True
+    if _WRITE_SED_INPLACE_RE.search(cmd):
+        return True
+    # `cat > file` / `cat >> file` with no input path before the redirect.
+    if re.match(r"^cat\s+(?:-[a-zA-Z]+\s+)*>>?", cmd):
+        return True
+    return False
+
+
+def _is_file_read_command(command: str) -> bool:
+    """True only for commands whose primary purpose is reading an existing file."""
+    if _is_write_only_command(command):
+        return False
+    return _extract_read_file_target(command) is not None
+
+
+def _extract_read_file_target(command: str) -> Optional[str]:
+    cmd = (command or "").strip()
+    if not cmd or _WRITE_HEREDOC_RE.search(cmd):
+        return None
+    for pat in _READ_TARGET_RES:
+        match = pat.search(cmd)
+        if not match:
+            continue
+        path = match.group(match.lastindex or 1).strip()
+        if path and not path.startswith("-") and path not in (">", ">>"):
+            return path
+    return None
+
+
+def _resolve_repo_path(repo_dir: str, path: str) -> str:
+    cleaned = (path or "").strip().strip("'\"")
+    if not cleaned or cleaned == "-":
+        return ""
+    if cleaned.startswith("~/"):
+        cleaned = cleaned[2:]
+    if os.path.isabs(cleaned):
+        return os.path.normpath(cleaned)
+    return os.path.normpath(os.path.join(repo_dir, cleaned.lstrip("./")))
+
+
+def _find_paths_by_basename(repo_dir: str, basename: str, *, limit: int = _MISSING_FILE_BASENAME_HINT_LIMIT) -> List[str]:
+    if not basename or basename in (".", ".."):
+        return []
+    matches: List[str] = []
+    repo_dir = os.path.abspath(repo_dir)
+    for root, dir_names, file_names in os.walk(repo_dir, topdown=True, followlinks=False):
+        dir_names[:] = [name for name in dir_names if not _should_skip_dir(name)]
+        rel_root = os.path.relpath(root, repo_dir)
+        if rel_root == ".":
+            rel_root = ""
+        for name in file_names:
+            if name != basename:
+                continue
+            rel = os.path.join(rel_root, name) if rel_root else name
+            matches.append(rel.replace("\\", "/"))
+            if len(matches) >= limit:
+                return matches
+    return matches
+
+
+def _format_missing_read_basename_hint(repo_dir: str, missing_path: str) -> str:
+    basename = os.path.basename(missing_path.strip().strip("'\""))
+    if not basename:
+        return ""
+    matches = _find_paths_by_basename(repo_dir, basename)
+    if not matches:
+        return (
+            f"\n\n[File not found: `{missing_path}`. "
+            f"No other file named `{basename}` exists in the repository.]"
+        )
+    rows = "\n".join(f"  - {path}" for path in matches)
+    return (
+        f"\n\n[File not found: `{missing_path}`. "
+        f"Other file(s) named `{basename}` in the repository:\n{rows}]"
+    )
+
+
+def _augment_observation_for_missing_read(
+    command: str,
+    output_text: str,
+    returncode: int,
+    repo_dir: str,
+) -> str:
+    """When a read command targets a missing file, append same-basename search hits."""
+    if not _is_file_read_command(command):
+        return output_text
+    target = _extract_read_file_target(command)
+    if not target:
+        return output_text
+    resolved = _resolve_repo_path(repo_dir, target)
+    if resolved and os.path.isfile(resolved):
+        return output_text
+    if returncode == 0 and (output_text or "").strip() and not _MISSING_FILE_OUT_RE.search(output_text):
+        return output_text
+    hint = _format_missing_read_basename_hint(repo_dir, target)
+    if not hint:
+        return output_text
+    return (output_text or "").rstrip() + hint
+
+
+_GREP_FLAG_TAKES_ARG = frozenset({
+    "-e", "-f", "-m", "-A", "-B", "-C",
+    "--include", "--exclude", "--exclude-dir", "--include-dir",
+})
+_GREP_PARENT_OUTPUT_LIMIT = 8000
+
+
+@dataclass
+class _GrepEmptyTracker:
+    last_keyword: str = ""
+    consecutive_empty: int = 0
+
+
+def _grep_has_no_results(output_text: str, returncode: int) -> bool:
+    text = (output_text or "").strip()
+    if returncode != 1:
+        return False
+    if re.search(
+        r"(?:error|invalid|not found|not a directory|permission denied|memory exhausted)",
+        text,
+        re.I,
+    ):
+        return False
+    return not text
+
+
+def _parse_grep_command(command: str) -> Optional[Tuple[str, str, List[str], Optional[int]]]:
+    """Return (pattern, search_path, shlex_parts, path_token_index)."""
+    cmd = (command or "").strip()
+    if not re.match(r"^grep\b", cmd, re.I):
+        return None
+    try:
+        parts = shlex.split(cmd, posix=True)
+    except ValueError:
+        return None
+    if len(parts) < 2 or parts[0].lower() != "grep":
+        return None
+    patterns: List[str] = []
+    paths: List[Tuple[int, str]] = []
+    i = 1
+    while i < len(parts):
+        tok = parts[i]
+        if tok.startswith("-"):
+            if tok in _GREP_FLAG_TAKES_ARG:
+                if tok == "-e" and i + 1 < len(parts):
+                    patterns.append(parts[i + 1])
+                i += 2
+                continue
+            if tok.startswith("--") and "=" in tok:
+                i += 1
+                continue
+            i += 1
+            continue
+        if not patterns:
+            patterns.append(tok)
+        else:
+            paths.append((i, tok))
+        i += 1
+    if not patterns:
+        return None
+    keyword = "|".join(patterns)
+    if paths:
+        path_idx, search_path = paths[0]
+    else:
+        path_idx, search_path = None, "."
+    return keyword, search_path, parts, path_idx
+
+
+def _parent_folder_path(search_path: str) -> Optional[str]:
+    cleaned = (search_path or "").strip().strip("'\"")
+    if cleaned in ("", ".", "./"):
+        return None
+    norm = cleaned.replace("\\", "/").rstrip("/")
+    if not norm or norm == ".":
+        return None
+    parent = os.path.dirname(norm)
+    if not parent or parent == norm:
+        return None
+    return parent or "."
+
+
+def _build_grep_with_search_path(parts: List[str], path_idx: Optional[int], search_path: str) -> str:
+    new_parts = parts[:]
+    if path_idx is not None:
+        new_parts[path_idx] = search_path
+    else:
+        new_parts.append(search_path)
+    return shlex.join(new_parts)
+
+
+_GREP_BINARY_MISSING_RE = re.compile(
+    r"(?:^|\n)(?:/bin/)?(?:ba)?sh:\s*(?:line\s+\d+:\s*)?"
+    r"grep:\s*(?:command not found|not found)\s*$",
+    re.I,
+)
+
+
+def _grep_binary_unavailable(output_text: str, returncode: int) -> bool:
+    """True only when the grep binary failed to execute (Ubuntu: exit 127)."""
+    if returncode in (127, 126):
+        return True
+    text = (output_text or "").strip()
+    if not text:
+        return False
+    return bool(_GREP_BINARY_MISSING_RE.search(text))
+
+
+def _grep_flags_from_parts(parts: List[str]) -> Tuple[bool, bool]:
+    """Return (fixed_string, ignore_case) from a shlex-split grep argv."""
+    fixed = False
+    ignore_case = False
+    for tok in parts:
+        if tok in ("-F", "--fixed-strings"):
+            fixed = True
+        elif tok in ("-i", "--ignore-case"):
+            ignore_case = True
+        elif tok.startswith("-") and not tok.startswith("--") and len(tok) > 1:
+            for ch in tok[1:]:
+                if ch == "F":
+                    fixed = True
+                elif ch == "i":
+                    ignore_case = True
+    return fixed, ignore_case
+
+
+def _python_search_repo(
+    repo_dir: str,
+    pattern: str,
+    search_path: str,
+    *,
+    limit: int = 40,
+    fixed_string: bool = False,
+    ignore_case: bool = False,
+) -> Tuple[str, int]:
+    """In-process grep fallback when the grep binary is unavailable."""
+    if fixed_string:
+        expr = re.escape(pattern)
+    else:
+        expr = pattern
+    flags = re.IGNORECASE if ignore_case else 0
+    try:
+        regex = re.compile(expr, flags)
+    except re.error:
+        try:
+            regex = re.compile(re.escape(pattern), flags)
+        except re.error:
+            return f"invalid pattern: {pattern}", 2
+    root = _resolve_repo_path(repo_dir, search_path)
+    if not os.path.isdir(root):
+        return f"not a directory: {search_path}", 2
+    repo_abs = os.path.abspath(repo_dir)
+    matches: List[str] = []
+    for dirpath, dirnames, filenames in os.walk(root, topdown=True):
+        dirnames[:] = [name for name in dirnames if not _should_skip_dir(name)]
+        for name in sorted(filenames):
+            full = os.path.join(dirpath, name)
+            rel = os.path.relpath(full, repo_abs).replace("\\", "/")
+            try:
+                with open(full, encoding="utf-8", errors="replace") as fh:
+                    for lineno, line in enumerate(fh, 1):
+                        if regex.search(line):
+                            matches.append(f"{rel}:{lineno}:{line.rstrip()}")
+                            break
+            except OSError:
+                continue
+            if len(matches) >= limit:
+                break
+        if len(matches) >= limit:
+            break
+    if not matches:
+        return "", 1
+    return "\n".join(matches), 0
+
+
+def _format_parent_grep_hint(
+    *,
+    keyword: str,
+    search_path: str,
+    parent_path: str,
+    parent_command: str,
+    parent_output: str,
+    parent_returncode: int,
+) -> str:
+    body = truncate_text(parent_output or "", _GREP_PARENT_OUTPUT_LIMIT)
+    return (
+        f"\n\n[Grep found no matches twice in a row for `{keyword}` under "
+        f"`{search_path}`. Automatic search in parent folder `{parent_path}`:\n"
+        f"$ {parent_command}\n"
+        f"{body}\n"
+        f"(exit {parent_returncode})]"
+    )
+
+
+def _augment_observation_for_empty_grep(
+    command: str,
+    output_text: str,
+    returncode: int,
+    repo_dir: str,
+    *,
+    tracker: _GrepEmptyTracker,
+    command_timeout: int,
+) -> str:
+    """After two consecutive empty greps for the same keyword, search the parent folder."""
+    parsed = _parse_grep_command(command)
+    if parsed is None:
+        tracker.last_keyword = ""
+        tracker.consecutive_empty = 0
+        return output_text
+    keyword, search_path, parts, path_idx = parsed
+    normalized = keyword.strip().strip("'\"")
+    if not normalized:
+        return output_text
+    if not _grep_has_no_results(output_text, returncode):
+        tracker.last_keyword = normalized
+        tracker.consecutive_empty = 0
+        return output_text
+    if normalized == tracker.last_keyword:
+        tracker.consecutive_empty += 1
+    else:
+        tracker.last_keyword = normalized
+        tracker.consecutive_empty = 1
+    if tracker.consecutive_empty < 2:
+        return output_text
+    tracker.consecutive_empty = 0
+    parent_path = _parent_folder_path(search_path)
+    if parent_path is None:
+        return (
+            (output_text or "").rstrip()
+            + f"\n\n[Grep found no matches twice in a row for `{normalized}`. "
+            f"Search path `{search_path}` has no parent folder to widen to.]"
+        )
+    parent_command = _build_grep_with_search_path(parts, path_idx, parent_path)
+    parent_result = execute_command(
+        parent_command, cwd=repo_dir, timeout=command_timeout,
+    )
+    parent_output = parent_result.get("output") or ""
+    parent_returncode = int(parent_result.get("returncode") or 0)
+    if _grep_binary_unavailable(parent_output, parent_returncode):
+        fixed, ignore_case = _grep_flags_from_parts(parts)
+        parent_output, parent_returncode = _python_search_repo(
+            repo_dir,
+            normalized,
+            parent_path,
+            fixed_string=fixed,
+            ignore_case=ignore_case,
+        )
+        parent_command = (
+            f"(grep unavailable; in-process search for `{normalized}` under `{parent_path}`)"
+        )
+    hint = _format_parent_grep_hint(
+        keyword=normalized,
+        search_path=search_path,
+        parent_path=parent_path,
+        parent_command=parent_command,
+        parent_output=parent_output,
+        parent_returncode=parent_returncode,
+    )
+    return (output_text or "").rstrip() + hint
+
+
+_SED_SHELL_ERROR_RE = re.compile(
+    r"Syntax error|unexpected|word unexpected|unterminated|invalid option",
+    re.I,
+)
+# GNU sed on Ubuntu (returncode 1) when the substitution itself is invalid.
+_GNU_SED_ERROR_RE = re.compile(
+    r"\bsed:\s.*(?:expression|unknown option|unterminated|invalid)",
+    re.I,
+)
+
+
+@dataclass
+class _SedFailureTracker:
+    consecutive: int = 0
+
+
+def _is_sed_inplace_command(command: str) -> bool:
+    return bool(_WRITE_SED_INPLACE_RE.search((command or "").strip()))
+
+
+def _sed_shell_failed(output_text: str, returncode: int) -> bool:
+    if returncode not in (2, 126, 127):
+        return False
+    return bool(_SED_SHELL_ERROR_RE.search(output_text or ""))
+
+
+def _sed_command_failed(output_text: str, returncode: int) -> bool:
+    """True for bash quoting errors or GNU sed expression failures (Ubuntu/Linux)."""
+    if returncode == 0:
+        return False
+    text = output_text or ""
+    if _sed_shell_failed(text, returncode):
+        return True
+    if returncode == 1 and _GNU_SED_ERROR_RE.search(text):
+        return True
+    return False
+
+
+def _extract_sed_target_file(command: str) -> str:
+    cmd = (command or "").strip()
+    try:
+        parts = shlex.split(cmd, posix=True)
+    except ValueError:
+        parts = []
+    for tok in reversed(parts):
+        if tok.startswith("-"):
+            continue
+        cleaned = tok.strip("'\"")
+        if re.fullmatch(r"[\w./~-]+\.\w+", cleaned):
+            return cleaned
+    match = re.search(r"([\w./~-]+\.\w+)\s*$", cmd)
+    return match.group(1) if match else "path/to/file"
+
+
+def _sed_substitution_is_complex(command: str) -> bool:
+    """True when sed -i is too complex for bash quoting (will likely fail on Ubuntu)."""
+    cmd = (command or "").strip()
+    if not _is_sed_inplace_command(cmd):
+        return False
+    if re.search(r"s\|", cmd) and ("'" in cmd or '"' in cmd):
+        return True
+    if "'\\''" in cmd or "\\'" in cmd:
+        return True
+    if "<" in cmd and ">" in cmd:
+        return True
+    if cmd.count("'") >= 3:
+        return True
+    if cmd.count('"') >= 2 and "'" in cmd:
+        return True
+    if re.search(r"s[\|/][^|/]{35,}", cmd):
+        return True
+    return False
+
+
+def _format_sed_failure_hint(target_file: str, *, consecutive: int = 1) -> str:
+    file_ref = target_file or "path/to/file"
+    if consecutive >= 2:
+        lead = "Stop retrying sed -- shell quoting will keep failing."
+    else:
+        lead = "Do NOT retry sed for this edit."
+    return (
+        f"\n\n[sed failed: {lead}\n\n"
+        f"sed -i cannot handle replacements when the old or new text contains "
+        f"quotes, HTML, pipes (|), backslashes, or semicolons.\n\n"
+        f"Use this instead:\n"
+        f"1. Read the file:\n\n"
+        f"```bash\ncat {file_ref}\n```\n\n"
+        f"2. Rewrite the full file with a heredoc:\n\n"
+        f"```bash\ncat <<'EOF' > {file_ref}\n"
+        f"...paste the complete file with your fix...\n"
+        f"EOF\n```\n\n"
+        f"Reserve sed -i ONLY for one simple token with no special characters:\n"
+        f"sed -i 's/old_token/new_token/' {file_ref}]"
+    )
+
+
+def _augment_observation_for_sed_failure(
+    command: str,
+    output_text: str,
+    returncode: int,
+    *,
+    tracker: _SedFailureTracker,
+) -> str:
+    if not _is_sed_inplace_command(command):
+        return output_text
+    if _sed_command_failed(output_text, returncode):
+        tracker.consecutive += 1
+        hint = _format_sed_failure_hint(
+            _extract_sed_target_file(command),
+            consecutive=tracker.consecutive,
+        )
+        return (output_text or "").rstrip() + hint
+    if returncode == 0:
+        tracker.consecutive = 0
+    return output_text
 
 
 _MSG_ERROR_LINE_RE = re.compile(
@@ -1638,6 +2148,172 @@ def _sanitize_patch(patch_text: str) -> str:
 
 
 # ============================================================
+# requirement checker (pre-submit LLM review)
+# ============================================================
+
+_REQUIREMENT_CHECK_MIN_BUDGET_SECONDS = 55.0
+_REQUIREMENT_CHECK_MAX_RUNS = 2
+_REQUIREMENT_CHECK_MAX_PATCH_CHARS = 48000
+
+
+@dataclass
+class _RequirementCheckResult:
+    complete: bool
+    missing_requirements: List[str]
+    defects: List[str]
+    feedback: str
+
+
+def _agent_loop_remaining_seconds(started: float, wall_clock_limit: float) -> float:
+    if wall_clock_limit <= 0:
+        return float("inf")
+    return wall_clock_limit - (time.monotonic() - started)
+
+
+def _requirement_checker_instruction() -> str:
+    return (
+        "You are a rigorous code-review checker for an autonomous coding agent. "
+        "Given a task description, a git diff patch, and the current on-disk "
+        "contents of modified files, decide whether the patch FULLY implements "
+        "every stated requirement in reachable, working code.\n\n"
+        "Grade strictly:\n"
+        "- Partial stubs, TODOs, placeholders, bare pass, NotImplemented, or "
+        "unwired symbols earn NO credit for that requirement.\n"
+        "- Code that merely suggests intent without producing the behavior does "
+        "not count.\n"
+        "- Wrong-file edits, missing imports, syntax issues visible in the patch, "
+        "and unrelated churn are defects.\n"
+        "- If the task asks for a test or proof, the patch must include a focused "
+        "regression test or equivalent demonstration unless truly impossible.\n"
+        "- Deletion-only changes count only when the remaining code still satisfies "
+        "the requirement.\n\n"
+        "List every missing or defective requirement specifically. Feedback must be "
+        "actionable: name the file/symbol/behavior to fix and what to implement.\n\n"
+        "Return JSON only with this exact shape:\n"
+        "{\n"
+        '  "complete": true | false,\n'
+        '  "missing_requirements": ["..."],\n'
+        '  "defects": ["..."],\n'
+        '  "feedback": "specific guidance for the agent to finish or repair the patch"\n'
+        "}\n"
+        "Set complete=true ONLY when every core requirement is implemented in "
+        "reachable code with no material defects."
+    )
+
+
+def _parse_requirement_checker_reply(text: str) -> Optional[_RequirementCheckResult]:
+    payload = _extract_json_object(text or "")
+    if payload is None:
+        return None
+    complete_raw = payload.get("complete")
+    if isinstance(complete_raw, str):
+        complete = complete_raw.strip().lower() in ("true", "yes", "1")
+    else:
+        complete = bool(complete_raw)
+
+    def _string_list(key: str) -> List[str]:
+        raw = payload.get(key)
+        if not isinstance(raw, list):
+            return []
+        out: List[str] = []
+        for item in raw:
+            s = str(item or "").strip()
+            if s and s not in out:
+                out.append(s)
+        return out[:12]
+
+    feedback = str(payload.get("feedback") or "").strip()
+    missing = _string_list("missing_requirements")
+    defects = _string_list("defects")
+    if not feedback and (missing or defects):
+        parts = []
+        if missing:
+            parts.append("Missing: " + "; ".join(missing[:6]))
+        if defects:
+            parts.append("Defects: " + "; ".join(defects[:6]))
+        feedback = " ".join(parts)
+    return _RequirementCheckResult(
+        complete=complete,
+        missing_requirements=missing,
+        defects=defects,
+        feedback=feedback,
+    )
+
+
+def _format_requirement_checker_message(result: _RequirementCheckResult) -> str:
+    lines = [
+        "[Pre-submit review: the patch does NOT yet fully satisfy the task.]\n",
+        "An independent requirement checker reviewed your current diff and worktree. "
+        "Address every gap below before submitting again. Edit or supplement the "
+        "patch so each requirement is implemented in reachable, working code -- not "
+        "stubs, dead branches, or partial edits.",
+    ]
+    if result.missing_requirements:
+        lines.append("\n## Missing requirements")
+        for i, item in enumerate(result.missing_requirements, 1):
+            lines.append(f"{i}. {item}")
+    if result.defects:
+        lines.append("\n## Defects to fix")
+        for i, item in enumerate(result.defects, 1):
+            lines.append(f"{i}. {item}")
+    if result.feedback:
+        lines.append("\n## Specific guidance")
+        lines.append(result.feedback)
+    lines.append(
+        f"\nWhen every requirement is fully implemented and verified, run "
+        f"`echo {COMPLETION_SENTINEL}` again."
+    )
+    return "\n".join(lines)
+
+
+def _check_patch_with_llm_requirement_checker(
+    *,
+    model_name: str,
+    base_url: str,
+    auth_token: str,
+    issue_text: str,
+    patch_text: str,
+    repo_dir: str,
+) -> Optional[_RequirementCheckResult]:
+    """Run a one-shot LLM review of the current patch. Fail-open on error."""
+    if not (issue_text or "").strip() or not (patch_text or "").strip():
+        return None
+    patch_for_prompt = patch_text.strip()
+    if len(patch_for_prompt) > _REQUIREMENT_CHECK_MAX_PATCH_CHARS:
+        patch_for_prompt = (
+            patch_for_prompt[:_REQUIREMENT_CHECK_MAX_PATCH_CHARS]
+            + "\n... [patch truncated for checker prompt]"
+        )
+    context_files = _load_patch_context_files(repo_dir, patch_text, from_reset=False)
+    context_block = _format_patch_context_files(context_files, from_reset=False)
+    criteria = extract_criteria(issue_text)
+    checklist = format_checklist(criteria)
+    prompt = (
+        _requirement_checker_instruction()
+        + "\n\n## Task\n"
+        + issue_text.strip()
+        + (checklist or "")
+        + "\n\n## Current patch\n```diff\n"
+        + patch_for_prompt
+        + "\n```\n"
+        + context_block
+    )
+    checker = ChatModel(
+        model_name=model_name,
+        base_url=base_url,
+        auth_token=auth_token,
+        max_completion_tokens=1024,
+        request_timeout=90.0,
+        max_attempts=2,
+    )
+    try:
+        reply = checker.query([{"role": "user", "content": prompt}])
+    except ModelQueryError:
+        return None
+    return _parse_requirement_checker_reply(reply)
+
+
+# ============================================================
 # agent loop -- king verbatim except for the robust action parser
 # ============================================================
 
@@ -1697,6 +2373,9 @@ def run_agent_loop(*, config: AgentRunConfig, task: str) -> AgentOutcome:
     keywords_enrichable = len(task_keywords) < 8
     write_deadline_fired = False
     _context_evicted = False
+    requirement_checker_runs = 0
+    grep_empty_tracker = _GrepEmptyTracker()
+    sed_failure_tracker = _SedFailureTracker()
 
     for step in range(1, max(1, config.max_steps) + 1):
         if 0 < config.wall_clock_limit <= time.monotonic() - started:
@@ -1765,9 +2444,28 @@ def run_agent_loop(*, config: AgentRunConfig, task: str) -> AgentOutcome:
             continue
         format_retries = 0
 
-        result = execute_command(command, cwd=config.repo_dir, timeout=config.command_timeout)
-        output_text = result.get("output") or ""
-        returncode = int(result.get("returncode") or 0)
+        if _sed_substitution_is_complex(command):
+            target_file = _extract_sed_target_file(command)
+            sed_failure_tracker.consecutive += 1
+            output_text = _format_sed_failure_hint(
+                target_file,
+                consecutive=sed_failure_tracker.consecutive,
+            )
+            returncode = 2
+            log_lines.append(
+                f"[step {step}] complex sed blocked (not executed): "
+                f"{truncate_text(command, 200)}"
+            )
+        else:
+            result = execute_command(command, cwd=config.repo_dir, timeout=config.command_timeout)
+            output_text = result.get("output") or ""
+            returncode = int(result.get("returncode") or 0)
+            output_text = _augment_observation_for_sed_failure(
+                command,
+                output_text,
+                returncode,
+                tracker=sed_failure_tracker,
+            )
         log_lines.append(f"[step {step}] $ {command}\n{truncate_text(output_text, 2000)}")
         if _is_submission(output_text, returncode):
             if not collect_repo_patch(config.repo_dir).strip():
@@ -1777,25 +2475,54 @@ def run_agent_loop(*, config: AgentRunConfig, task: str) -> AgentOutcome:
                     write_deadline_fired = True
                     messages.append({"role": "user", "content": _write_deadline_message(step)})
                     log_lines.append(f"[step {step}] write deadline fired (empty submit)")
-                continue            
-            if False and not getattr(config, '_checklist_intercepted', False) and config.issue_text:
-                criteria = extract_criteria(config.issue_text)
-                checklist = format_checklist(criteria)
-                if checklist and step < config.max_steps:
-                    config._checklist_intercepted = True  # type: ignore[attr-defined]
-                    intercept_msg = (
-                        f"Before submitting, verify every requirement below is "
-                        f"implemented in reachable code -- not stubs or dead branches.\n"
-                        f"If anything is missing, make your final edits now.\n"
-                        f"If full coverage is confirmed, run `echo {COMPLETION_SENTINEL}` again.\n"
-                        f"{checklist}"
+                continue
+            current_patch = collect_repo_patch(config.repo_dir)
+            remaining = _agent_loop_remaining_seconds(started, config.wall_clock_limit)
+            should_check = (
+                config.issue_text
+                and requirement_checker_runs < _REQUIREMENT_CHECK_MAX_RUNS
+                and step < config.max_steps
+                and remaining >= _REQUIREMENT_CHECK_MIN_BUDGET_SECONDS
+            )
+            if should_check:
+                requirement_checker_runs += 1
+                check_result = _check_patch_with_llm_requirement_checker(
+                    model_name=config.model_name,
+                    base_url=config.base_url,
+                    auth_token=config.auth_token,
+                    issue_text=config.issue_text,
+                    patch_text=current_patch,
+                    repo_dir=config.repo_dir,
+                )
+                if check_result is not None and not check_result.complete:
+                    messages.append({
+                        "role": "user",
+                        "content": _format_requirement_checker_message(check_result),
+                    })
+                    log_lines.append(
+                        f"[step {step}] requirement checker rejected submit "
+                        f"(missing={len(check_result.missing_requirements)}, "
+                        f"defects={len(check_result.defects)})"
                     )
-                    messages.append({"role": "user", "content": intercept_msg})
-                    log_lines.append(f"[step {step}] checklist interception fired")
-                    continue  # give agent one more turn to self-verify
+                    continue
+                if check_result is not None:
+                    log_lines.append(f"[step {step}] requirement checker passed")
+                else:
+                    log_lines.append(f"[step {step}] requirement checker skipped (error)")
             exit_status = "Submitted"
             message = f"submitted after {step} step(s)"
             break
+        output_text = _augment_observation_for_missing_read(
+            command, output_text, returncode, config.repo_dir,
+        )
+        output_text = _augment_observation_for_empty_grep(
+            command,
+            output_text,
+            returncode,
+            config.repo_dir,
+            tracker=grep_empty_tracker,
+            command_timeout=config.command_timeout,
+        )
         observation = render_observation(
             returncode=returncode,
             output_text=truncate_text(output_text, config.max_observation_chars),
@@ -2560,7 +3287,7 @@ def _load_patch_context_files(
     from_reset: bool = True,
     max_total_chars: int = 80000,
 ) -> _PatchContextFiles:
-    """Load on-disk contents for modified (changed) paths in *patch_text* only."""
+    """Load on-disk contents for modified paths in *patch_text* only."""
     _, modified_paths, _ = _classify_patch_file_ops(patch_text)
 
     entries: List[_PatchFileEntry] = []
@@ -2601,11 +3328,11 @@ def _format_patch_context_files(
         ]
     else:
         parts = [
-            "\n\n## Changed files in the previous patch (current worktree)\n"
+            "\n\n## Modified files in the patch (current worktree)\n"
             "Only modified paths are listed below; added and deleted paths appear "
-            "in the patch diff above. Git has **not** been reset. Each entry labels "
-            "FILE NAME separately from FILE CONTENT. FILE CONTENT is the current "
-            "on-disk content (includes prior patch edits).\n"
+            "in the patch diff above only. Git has **not** been reset. Each entry "
+            "labels FILE NAME separately from FILE CONTENT. FILE CONTENT is the "
+            "current on-disk content (includes prior patch edits).\n"
             "### Modified files\n",
         ]
     for entry in context.entries:
@@ -2660,6 +3387,34 @@ def build_repair_prompt(
             "the worktree still reflects this patch. Inspect the current state and "
             "repair it.\n\n"
             f"```diff\n{previous_patch.strip()}\n```\n"
+        )
+    context_block = _format_patch_context_files(context_files, from_reset=False)
+    return base + patch_block + context_block
+
+
+def build_polish_prompt(
+    issue_text: str,
+    repo_summary: str,
+    current_patch: str,
+    polish_message: str,
+    context_files: Optional[_PatchContextFiles] = None,
+    preloaded_context: str = "",
+) -> str:
+    """Polish pass prompt: task, current patch diff, and worktree file context."""
+    base = build_initial_user_prompt(
+        _build_polish_task(issue_text, polish_message),
+        repo_summary,
+        preloaded_context,
+    )
+    patch_block = ""
+    if (current_patch or "").strip():
+        patch_block = (
+            "\n\n## Current patch (already applied in the worktree)\n"
+            "The diff below is the full change set produced so far. Git has **not** "
+            "been reset; the worktree reflects this patch. Added and deleted paths "
+            "appear in the diff only; on-disk FILE CONTENT blocks below cover "
+            "**modified** files only.\n\n"
+            f"```diff\n{current_patch.strip()}\n```\n"
         )
     context_block = _format_patch_context_files(context_files, from_reset=False)
     return base + patch_block + context_block
@@ -4729,7 +5484,7 @@ def _recovery_prompt(issue: str) -> str:
     issue_lower = issue.lower()
     if any(x in issue_lower for x in ['.go', 'golang', ' go ', 'goroutine', 'sync.', 'chan ']):
         lang_hint = (
-            "This is a Go task. In 3 steps: "
+            "This is a Go task. In 5 steps: "
             "(1) grep for the most relevant .go source file, "
             "(2) read that file, "
             "(3) make ONE minimal edit that implements a core requirement in "
@@ -4737,21 +5492,21 @@ def _recovery_prompt(issue: str) -> str:
         )
     elif any(x in issue_lower for x in ['.cpp', '.hpp', 'c++', 'cmake']):
         lang_hint = (
-            "This is a C++ task. In 3 steps: "
+            "This is a C++ task. In 5 steps: "
             "(1) grep for the relevant .cpp/.h file, "
             "(2) read it, "
             "(3) make ONE targeted change that satisfies a core requirement and submit."
         )
     elif any(x in issue_lower for x in ['.ts', '.tsx', 'typescript']):
         lang_hint = (
-            "This is a TypeScript task. In 3 steps: "
+            "This is a TypeScript task. In 5 steps: "
             "(1) find the relevant .ts file, "
             "(2) read the affected class/function, "
             "(3) make ONE precise change on a live code path and submit."
         )
     else:
         lang_hint = (
-            "In 3 steps: (1) find the most relevant file, "
+            "In 5 steps: (1) find the most relevant file, "
             "(2) read it, (3) implement one core requirement in reachable code "
             "and submit."
         )
@@ -4944,9 +5699,20 @@ def _run_patch_pipeline(
                 wall_clock_limit=max(10.0, time_remaining - WALL_CLOCK_RESERVE_SECONDS),
                 issue_text=issue_text,
             )
+            polish_context = _load_patch_context_files(
+                repo_dir,
+                outcome.patch,
+                from_reset=False,
+            )
             polished = run_agent_loop(
                 config=polish_config,
-                task=build_initial_user_prompt(_build_polish_task(issue_text, message), repo_summary, ""),
+                task=build_polish_prompt(
+                    issue_text,
+                    repo_summary,
+                    outcome.patch,
+                    message,
+                    polish_context,
+                ),
             )
             pp = polished.patch
             if not _syntax_errors(repo_dir, pp) and _polish_worth_adopting(outcome.patch, pp):
@@ -5127,4 +5893,3 @@ def solve(
             "success": bool(fallback_patch.strip()),
             "message": "agent crashed; returning the on-disk repository diff",
         }
-
