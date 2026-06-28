@@ -1363,11 +1363,12 @@ def _augment_observation_for_sed_failure(
 
 
 # ===================== BEATER LEVER B: broken-edit recovery augmentor =====================
-# uid216 recovers grep/read/sed FAILURES but not "my edit broke the file". The weak
-# Qwen3 often writes an edit that leaves a file syntactically broken -> the patch earns
-# ZERO coverage on that change and silently loses the round. A 4th inline augmentor (same
-# style as uid216's three) detects a broken just-edited file and hints the model to fix
-# it. Fail-open to the unchanged observation; capped fires/file. Purely additive.
+# uid18 (like uid216) recovers grep/read/sed FAILURES but not "my edit broke the file".
+# The weak Qwen3 often writes an edit that leaves a file syntactically broken -> the patch
+# earns ZERO coverage on that change and silently loses the round. A 4th inline augmentor
+# (same style as the existing three) detects a broken just-edited file and hints the model
+# to fix it. Fail-open to the unchanged observation; capped fires/file. Purely additive.
+# PROVEN: this + LEVER A beat the ~identical uid216 base +10/+14 (duels 7509/7510).
 _BROKEN_EDIT_HINT_MAX_PER_FILE = 2
 
 
@@ -1377,7 +1378,7 @@ class _BrokenEditTracker:
 
 
 def _extract_edit_target(command: str) -> Optional[str]:
-    """The path a write/edit command targets (reuses uid216's _EDIT_TARGET_RES)."""
+    """The path a write/edit command targets (reuses the king's _EDIT_TARGET_RES)."""
     cmd = (command or "").strip()
     if not cmd:
         return None
@@ -1393,7 +1394,7 @@ def _extract_edit_target(command: str) -> Optional[str]:
 
 def _broken_edit_error(repo_dir: str, rel: str) -> Optional[str]:
     """Short description if the just-edited file is now syntactically broken (.py via
-    compile; other languages via uid216's _delimiter_balance_error), else None."""
+    compile; other languages via the king's _delimiter_balance_error), else None."""
     try:
         abspath = os.path.join(repo_dir, rel)
         if not os.path.isfile(abspath):
@@ -2231,7 +2232,7 @@ def _sanitize_patch(patch_text: str) -> str:
 # requirement checker (pre-submit LLM review)
 # ============================================================
 
-_REQUIREMENT_CHECK_MIN_BUDGET_SECONDS = 55.0
+_REQUIREMENT_CHECK_MIN_BUDGET_SECONDS = 80.0  # BEATER E6: 55->80, fail-safe nudge at uid18's 25 timeouts/duel
 _REQUIREMENT_CHECK_MAX_RUNS = 2
 _REQUIREMENT_CHECK_MAX_PATCH_CHARS = 48000
 
@@ -2564,10 +2565,11 @@ def run_agent_loop(*, config: AgentRunConfig, task: str) -> AgentOutcome:
                 and requirement_checker_runs < _REQUIREMENT_CHECK_MAX_RUNS
                 and step < config.max_steps
                 and remaining >= _REQUIREMENT_CHECK_MIN_BUDGET_SECONDS
-                # BEATER LEVER A: suppress the checker when the patch is already
-                # substantial+scoped -- those are the rounds uid216 already wins, and
-                # the checker's scope-creep nudge there OVER-ENGINEERS them into the
-                # completed-but-thin STRONG/MID losses. Fail-open: any doubt -> checker fires.
+                # BEATER LEVER A: suppress the inline checker when the patch is already
+                # substantial+scoped -- those are rounds uid18 already wins, and the
+                # checker's scope-creep nudge there OVER-ENGINEERS them into completed-thin
+                # losses AND burns an LLM call (uid18 has 25 timeouts/duel). Fail-open:
+                # any doubt -> checker fires (keeps the thin/whiff wins).
                 and not _patch_is_substantial(current_patch, config.issue_text)
             )
             if should_check:
@@ -5511,7 +5513,7 @@ def _patch_is_substantial(patch_text: str, issue_text: str) -> bool:
     """True when the current patch already looks complete-and-scoped, so firing the
     requirement-checker (which nudges scope-creep) is more likely to OVER-ENGINEER it
     into a loss than to help. Reuses _scope_creep_reason's per-file accounting. Fail-open
-    to False (on any doubt, let the checker fire exactly as uid216 does today)."""
+    to False (on any doubt, let the checker fire exactly as uid18 does today)."""
     try:
         if not (patch_text or "").strip():
             return False
