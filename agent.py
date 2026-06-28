@@ -1186,7 +1186,6 @@ def _augment_observation_for_empty_grep(
     *,
     tracker: _GrepEmptyTracker,
     command_timeout: int,
-    remaining_seconds: float = float("inf"),
 ) -> str:
     """After two consecutive empty greps for the same keyword, search the parent folder."""
     parsed = _parse_grep_command(command)
@@ -1210,25 +1209,6 @@ def _augment_observation_for_empty_grep(
     if tracker.consecutive_empty < 2:
         return output_text
     tracker.consecutive_empty = 0
-    # WALL-GUARD: the parent-folder widen below runs an UNBUDGETED subprocess
-    # bounded only by command_timeout (no global wall check). Near the deadline it
-    # can burn up to command_timeout and tip a TLE-prone round over the wall ->
-    # TimeExceeded -> empty patch -> auto-loss. When budget can't afford the spend,
-    # decline the subprocess and return a non-empty text-only widen hint instead.
-    # Above the reserve it runs exactly as today (byte-identical). Never-worse.
-    try:
-        _afford_widen = remaining_seconds >= (
-            float(command_timeout) + COMPAREPATCH_MIN_REMAINING_SECONDS
-        )
-    except Exception:
-        _afford_widen = True
-    if not _afford_widen:
-        return (
-            (output_text or "").rstrip()
-            + f"\n\n[Grep found no matches twice in a row for `{normalized}`. "
-            f"Widen the search yourself (try the parent folder or a different "
-            f"keyword); time budget is low so the automatic widen was skipped.]"
-        )
     parent_path = _parent_folder_path(search_path)
     if parent_path is None:
         return (
@@ -2583,15 +2563,7 @@ def run_agent_loop(*, config: AgentRunConfig, task: str) -> AgentOutcome:
                 config.issue_text
                 and requirement_checker_runs < _REQUIREMENT_CHECK_MAX_RUNS
                 and step < config.max_steps
-                # RESERVE-GATE: the checker is blind to the 100s dual-patch reserve
-                # (COMPAREPATCH_MIN_REMAINING_SECONDS). Firing it in the 55-155s band
-                # drains attempt-1 below 100s and silently forfeits the dual-patch
-                # hedge (compare/apply path) + risks re-edit churn -- both strictly
-                # negative. Above 155s behavior is byte-identical (checker still fires).
-                and remaining >= (
-                    COMPAREPATCH_MIN_REMAINING_SECONDS
-                    + _REQUIREMENT_CHECK_MIN_BUDGET_SECONDS
-                )
+                and remaining >= _REQUIREMENT_CHECK_MIN_BUDGET_SECONDS
                 # BEATER LEVER A: suppress the checker when the patch is already
                 # substantial+scoped -- those are the rounds uid216 already wins, and
                 # the checker's scope-creep nudge there OVER-ENGINEERS them into the
@@ -2636,9 +2608,6 @@ def run_agent_loop(*, config: AgentRunConfig, task: str) -> AgentOutcome:
             config.repo_dir,
             tracker=grep_empty_tracker,
             command_timeout=config.command_timeout,
-            remaining_seconds=_agent_loop_remaining_seconds(
-                started, config.wall_clock_limit
-            ),
         )
         output_text = _augment_observation_for_broken_edit(  # BEATER LEVER B
             command, output_text, config.repo_dir, tracker=broken_edit_tracker,
@@ -3815,11 +3784,11 @@ def _compare_patches_with_llm(
     patch_b: str,
 ) -> str:
     """Return 'A' or 'B'. Fail-open to 'A' on error or tie."""
-    if _patches_too_similar(patch_a, patch_b):
-        return "A"
     heuristic = _COMPARE_heuristic(patch_a, patch_b)
     if heuristic is not None:
         return heuristic
+    if _patches_too_similar(patch_a, patch_b):
+        return "A"
     model = ChatModel(
         model_name=model_name,
         base_url=base_url,
@@ -5762,7 +5731,9 @@ def _run_patch_pipeline(
             )
             recovered = run_agent_loop(
                 config=recovery_config,
-                task=build_initial_user_prompt(recovery_prompt, repo_summary, ""),
+                task=build_initial_user_prompt(
+                    recovery_prompt, repo_summary, _issue_ranked_context(issue_text, repo_dir)
+                ),
             )
             if recovered.patch.strip():
                 outcome = recovered
@@ -5802,13 +5773,13 @@ def _run_patch_pipeline(
                 ),
             )
             rp = repaired.patch
+            adopt = False
             if rp.strip() and not _syntax_errors(repo_dir, rp) and patch_acceptable(rp):
                 rtest = _python_test_outcome(repo_dir, rp)
-                adopt = False
                 if kind == "empty":
                     adopt = rtest != "fail"
                 elif kind == "corruption":
-                    adopt = not _patch_corruption_error(rp, repo_dir)
+                    adopt = rtest != "fail" and not _patch_corruption_error(rp, repo_dir)
                 elif kind == "scope":
                     adopt = rtest != "fail" and not _scope_creep_reason(issue_text, rp)
                 elif kind == "coverage":
@@ -5831,14 +5802,14 @@ def _run_patch_pipeline(
                 if adopt:
                     outcome = repaired
                     repair_note = " (repair adopted: %s)" % kind
+            if not adopt:
+                _restore_worktree_patch(repo_dir, outcome.patch)
     except Exception:
         repair_note = " (repair pass skipped after error)"
     try:
         remaining = _pipeline_remaining_seconds(started, post_pass_reserve)
         can_repair = remaining >= VERIFY_REPAIR_MIN_BUDGET_SECONDS
-        polish_reason = _repair_reason(
-            repo_dir, outcome.patch, issue_text=issue_text, check_tests=can_repair,
-        )
+        polish_reason = None
         time_remaining = _pipeline_remaining_seconds(started, post_pass_reserve)
         if False and polish_reason is None and can_repair and outcome.patch.strip() and time_remaining >= 90:
             message = (
