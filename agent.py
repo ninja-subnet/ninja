@@ -1210,12 +1210,13 @@ def _augment_observation_for_empty_grep(
     if tracker.consecutive_empty < 2:
         return output_text
     tracker.consecutive_empty = 0
-    # WALL-GUARD: the parent-folder widen below runs an UNBUDGETED subprocess
+    # WALL-GUARD (E2): the parent-folder widen below runs an UNBUDGETED subprocess
     # bounded only by command_timeout (no global wall check). Near the deadline it
     # can burn up to command_timeout and tip a TLE-prone round over the wall ->
     # TimeExceeded -> empty patch -> auto-loss. When budget can't afford the spend,
     # decline the subprocess and return a non-empty text-only widen hint instead.
-    # Above the reserve it runs exactly as today (byte-identical). Never-worse.
+    # Above the reserve it runs exactly as today (byte-identical). Never-worse,
+    # crash-safe (fail-open to _afford_widen=True on any error).
     try:
         _afford_widen = remaining_seconds >= (
             float(command_timeout) + COMPAREPATCH_MIN_REMAINING_SECONDS
@@ -2583,11 +2584,12 @@ def run_agent_loop(*, config: AgentRunConfig, task: str) -> AgentOutcome:
                 config.issue_text
                 and requirement_checker_runs < _REQUIREMENT_CHECK_MAX_RUNS
                 and step < config.max_steps
-                # RESERVE-GATE: the checker is blind to the 100s dual-patch reserve
-                # (COMPAREPATCH_MIN_REMAINING_SECONDS). Firing it in the 55-155s band
-                # drains attempt-1 below 100s and silently forfeits the dual-patch
-                # hedge (compare/apply path) + risks re-edit churn -- both strictly
-                # negative. Above 155s behavior is byte-identical (checker still fires).
+                # RESERVE-GATE (E1): the checker is blind to the 100s dual-patch
+                # reserve (COMPAREPATCH_MIN_REMAINING_SECONDS). Firing it in the
+                # 55-155s band drains attempt-1 below 100s and silently forfeits the
+                # dual-patch hedge (compare/apply path) + risks re-edit churn -- both
+                # strictly negative. Above 155s behavior is byte-identical (checker
+                # still fires). Never-worse, crash-safe (pure arithmetic).
                 and remaining >= (
                     COMPAREPATCH_MIN_REMAINING_SECONDS
                     + _REQUIREMENT_CHECK_MIN_BUDGET_SECONDS
@@ -3815,11 +3817,11 @@ def _compare_patches_with_llm(
     patch_b: str,
 ) -> str:
     """Return 'A' or 'B'. Fail-open to 'A' on error or tie."""
-    if _patches_too_similar(patch_a, patch_b):
-        return "A"
     heuristic = _COMPARE_heuristic(patch_a, patch_b)
     if heuristic is not None:
         return heuristic
+    if _patches_too_similar(patch_a, patch_b):
+        return "A"
     model = ChatModel(
         model_name=model_name,
         base_url=base_url,
@@ -5760,9 +5762,42 @@ def _run_patch_pipeline(
                 wall_clock_limit=max(10.0, remaining - 10.0),
                 issue_text=issue_text,
             )
+            # RECOVERY-CONTEXT BUDGET-GUARD (EDGE-RECOVERY): uid20 injects the full
+            # _issue_ranked_context (up to _PRELOAD_MAX_CHARS=12000) into the recovery
+            # run UNGUARDED. That preload is pinned in messages[:2] (never compressed
+            # by _cap_messages) and CANNOT be evicted mid-loop (the rich-graft eviction
+            # is gated on _RICH_CONTEXT_MARKER, which _issue_ranked_context never emits),
+            # so its ~3000-token tax is re-sent on EVERY recovery step. The recovery only
+            # fires when budget is ALREADY low (remaining>=60) and can run a 12-18 step
+            # loop in a ~50s window -- exactly where that tax steals solving steps and can
+            # convert a marginal recovery into a TLE/empty (the very loss it targets), and
+            # the same preload was ALREADY present in attempt-1, which still shipped empty.
+            # Shrink/skip the preload only when the recovery budget is provably tight;
+            # above the 155s reserve it is byte-identical to uid20 (full 12000). Crash-safe:
+            # any error -> full uid20 preload (fail-to-king-behavior).
+            try:
+                if remaining >= (
+                    COMPAREPATCH_MIN_REMAINING_SECONDS
+                    + _REQUIREMENT_CHECK_MIN_BUDGET_SECONDS
+                ):
+                    _recovery_cap = _PRELOAD_MAX_CHARS
+                elif remaining >= 80:
+                    _recovery_cap = 5000
+                else:
+                    _recovery_cap = 0
+                if _recovery_cap >= _PRELOAD_MAX_CHARS:
+                    _recovery_preload = _issue_ranked_context(issue_text, repo_dir)
+                elif _recovery_cap <= 0:
+                    _recovery_preload = ""
+                else:
+                    _recovery_preload = _issue_ranked_context(issue_text, repo_dir)[:_recovery_cap]
+            except Exception:
+                _recovery_preload = _issue_ranked_context(issue_text, repo_dir)
             recovered = run_agent_loop(
                 config=recovery_config,
-                task=build_initial_user_prompt(recovery_prompt, repo_summary, ""),
+                task=build_initial_user_prompt(
+                    recovery_prompt, repo_summary, _recovery_preload
+                ),
             )
             if recovered.patch.strip():
                 outcome = recovered
@@ -5802,13 +5837,13 @@ def _run_patch_pipeline(
                 ),
             )
             rp = repaired.patch
+            adopt = False
             if rp.strip() and not _syntax_errors(repo_dir, rp) and patch_acceptable(rp):
                 rtest = _python_test_outcome(repo_dir, rp)
-                adopt = False
                 if kind == "empty":
                     adopt = rtest != "fail"
                 elif kind == "corruption":
-                    adopt = not _patch_corruption_error(rp, repo_dir)
+                    adopt = rtest != "fail" and not _patch_corruption_error(rp, repo_dir)
                 elif kind == "scope":
                     adopt = rtest != "fail" and not _scope_creep_reason(issue_text, rp)
                 elif kind == "coverage":
@@ -5831,14 +5866,14 @@ def _run_patch_pipeline(
                 if adopt:
                     outcome = repaired
                     repair_note = " (repair adopted: %s)" % kind
+            if not adopt:
+                _restore_worktree_patch(repo_dir, outcome.patch)
     except Exception:
         repair_note = " (repair pass skipped after error)"
     try:
         remaining = _pipeline_remaining_seconds(started, post_pass_reserve)
         can_repair = remaining >= VERIFY_REPAIR_MIN_BUDGET_SECONDS
-        polish_reason = _repair_reason(
-            repo_dir, outcome.patch, issue_text=issue_text, check_tests=can_repair,
-        )
+        polish_reason = None
         time_remaining = _pipeline_remaining_seconds(started, post_pass_reserve)
         if False and polish_reason is None and can_repair and outcome.patch.strip() and time_remaining >= 90:
             message = (
@@ -5920,11 +5955,11 @@ def solve(
             started=started,
             # CLEAN-HEDGE EDIT 1: attempt-1 is the CLEAN full-budget solve. Use combo's
             # high-precision named-file preloader (the exact config that measured STRONG
-            # coverage 0.753 ~= king) -- NOT _issue_ranked_context, but _combined_preload_context,
-            # which on no-named-file tasks fires _localize_rich to prevent flying blind,
-            # while fully preserving the high-precision ranked files on STRONG rounds.
+            # coverage 0.753 ~= king) -- NOT _combined_preload_context, which on no-named-
+            # file tasks fires _localize_rich (the symbol graft PROVEN to crater STRONG
+            # 0.753->0.586, p=0.0025). The saboteur graft moves to the divergent attempt-2.
             main_task=build_initial_user_prompt(
-                issue, repo_summary, _combined_preload_context(issue, repo_path)
+                issue, repo_summary, _issue_ranked_context(issue, repo_path)
             ),
         )
         outcome = first_pipeline.outcome
@@ -6010,20 +6045,6 @@ def solve(
                                 and patch_acceptable(first_patch)
                             ):
                                 choice = "A"
-                            elif (
-                                choice == "A"
-                                and patch_acceptable(second_patch)
-                                and not _syntax_errors(repo_path, second_patch)
-                            ):
-                                # Symmetrically verify choice A. The worktree holds the SECOND patch (B) on disk now,
-                                # so we restore the first patch (A) temporarily to check its syntax using _syntax_errors.
-                                # If A is indeed broken, we flip the choice to B and restore the second patch back.
-                                if _restore_worktree_patch(repo_path, first_patch):
-                                    if _syntax_errors(repo_path, first_patch):
-                                        choice = "B"
-                                        _restore_worktree_patch(repo_path, second_patch)
-                                    else:
-                                        _restore_worktree_patch(repo_path, second_patch)
                             winning_patch = first_patch if choice == "A" else second_patch
                             ensemble_note = f" (dual-patch: chose {choice})"
                             if choice == "B":
