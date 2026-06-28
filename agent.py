@@ -1362,6 +1362,86 @@ def _augment_observation_for_sed_failure(
     return output_text
 
 
+# ===================== BEATER LEVER B: broken-edit recovery augmentor =====================
+# uid216 recovers grep/read/sed FAILURES but not "my edit broke the file". The weak
+# Qwen3 often writes an edit that leaves a file syntactically broken -> the patch earns
+# ZERO coverage on that change and silently loses the round. A 4th inline augmentor (same
+# style as uid216's three) detects a broken just-edited file and hints the model to fix
+# it. Fail-open to the unchanged observation; capped fires/file. Purely additive.
+_BROKEN_EDIT_HINT_MAX_PER_FILE = 2
+
+
+@dataclass
+class _BrokenEditTracker:
+    fires: dict = field(default_factory=dict)  # rel -> hint count
+
+
+def _extract_edit_target(command: str) -> Optional[str]:
+    """The path a write/edit command targets (reuses uid216's _EDIT_TARGET_RES)."""
+    cmd = (command or "").strip()
+    if not cmd:
+        return None
+    for pat in _EDIT_TARGET_RES:
+        m = pat.search(cmd)
+        if not m:
+            continue
+        cand = m.group(1).strip().strip("'\"")
+        if cand and cand not in ("/dev/null", "-") and "." in cand.rsplit("/", 1)[-1]:
+            return cand
+    return None
+
+
+def _broken_edit_error(repo_dir: str, rel: str) -> Optional[str]:
+    """Short description if the just-edited file is now syntactically broken (.py via
+    compile; other languages via uid216's _delimiter_balance_error), else None."""
+    try:
+        abspath = os.path.join(repo_dir, rel)
+        if not os.path.isfile(abspath):
+            return None
+        with open(abspath, "r", errors="ignore") as fh:
+            src = fh.read()
+        if not src.strip():
+            return None
+        if rel.endswith(".py"):
+            try:
+                compile(src, rel, "exec")
+                return None
+            except SyntaxError as exc:
+                return f"line {exc.lineno}: {exc.msg}"
+            except Exception:
+                return None
+        return _delimiter_balance_error(src, rel)
+    except Exception:
+        return None
+
+
+def _augment_observation_for_broken_edit(
+    command: str,
+    output_text: str,
+    repo_dir: str,
+    *,
+    tracker: _BrokenEditTracker,
+) -> str:
+    try:
+        if not _is_write_only_command(command):
+            return output_text
+        rel = _extract_edit_target(command)
+        if not rel or tracker.fires.get(rel, 0) >= _BROKEN_EDIT_HINT_MAX_PER_FILE:
+            return output_text
+        err = _broken_edit_error(repo_dir, rel)
+        if not err:
+            return output_text
+        tracker.fires[rel] = tracker.fires.get(rel, 0) + 1
+        hint = (
+            f"\n\n[edit check] Your last edit left {rel} SYNTACTICALLY BROKEN ({err}). "
+            f"A file that does not parse earns ZERO coverage on that change -- re-open "
+            f"{rel}, fix the error now, and verify it parses before submitting."
+        )
+        return (output_text or "").rstrip() + hint
+    except Exception:
+        return output_text
+
+
 _MSG_ERROR_LINE_RE = re.compile(
     r"Traceback \(most recent call last\)|"
     r"\b(Error|Exception|FAILED|Failure|AssertionError|SyntaxError|"
@@ -2376,6 +2456,7 @@ def run_agent_loop(*, config: AgentRunConfig, task: str) -> AgentOutcome:
     requirement_checker_runs = 0
     grep_empty_tracker = _GrepEmptyTracker()
     sed_failure_tracker = _SedFailureTracker()
+    broken_edit_tracker = _BrokenEditTracker()  # BEATER LEVER B
 
     for step in range(1, max(1, config.max_steps) + 1):
         if 0 < config.wall_clock_limit <= time.monotonic() - started:
@@ -2483,6 +2564,11 @@ def run_agent_loop(*, config: AgentRunConfig, task: str) -> AgentOutcome:
                 and requirement_checker_runs < _REQUIREMENT_CHECK_MAX_RUNS
                 and step < config.max_steps
                 and remaining >= _REQUIREMENT_CHECK_MIN_BUDGET_SECONDS
+                # BEATER LEVER A: suppress the checker when the patch is already
+                # substantial+scoped -- those are the rounds uid216 already wins, and
+                # the checker's scope-creep nudge there OVER-ENGINEERS them into the
+                # completed-but-thin STRONG/MID losses. Fail-open: any doubt -> checker fires.
+                and not _patch_is_substantial(current_patch, config.issue_text)
             )
             if should_check:
                 requirement_checker_runs += 1
@@ -2522,6 +2608,9 @@ def run_agent_loop(*, config: AgentRunConfig, task: str) -> AgentOutcome:
             config.repo_dir,
             tracker=grep_empty_tracker,
             command_timeout=config.command_timeout,
+        )
+        output_text = _augment_observation_for_broken_edit(  # BEATER LEVER B
+            command, output_text, config.repo_dir, tracker=broken_edit_tracker,
         )
         observation = render_observation(
             returncode=returncode,
@@ -5412,6 +5501,48 @@ def _scope_creep_reason(issue_text: str, patch_text: str):
         return None
     except Exception:
         return None
+
+
+# BEATER LEVER A: floor of added non-blank +lines for a patch to count as "substantial".
+_SUBSTANTIAL_MIN_ADDED_LINES = 8
+
+
+def _patch_is_substantial(patch_text: str, issue_text: str) -> bool:
+    """True when the current patch already looks complete-and-scoped, so firing the
+    requirement-checker (which nudges scope-creep) is more likely to OVER-ENGINEER it
+    into a loss than to help. Reuses _scope_creep_reason's per-file accounting. Fail-open
+    to False (on any doubt, let the checker fire exactly as uid216 does today)."""
+    try:
+        if not (patch_text or "").strip():
+            return False
+        cur_path = ""
+        prev_minus = None
+        new_files = set()
+        added_by_file = {}  # path -> count of added non-blank +lines (real, non-test edits)
+        for raw in patch_text.splitlines():
+            if raw.startswith("--- "):
+                prev_minus = raw[4:].strip()
+                continue
+            if raw.startswith("+++ "):
+                cur_path = raw[6:].strip() if raw.startswith("+++ b/") else raw[4:].strip()
+                if prev_minus == "/dev/null" and cur_path != "/dev/null":
+                    new_files.add(cur_path)
+                continue
+            if raw.startswith("+") and not raw.startswith("+++"):
+                body = raw[1:]
+                if body.strip() and cur_path and not _is_test_path(cur_path):
+                    added_by_file[cur_path] = added_by_file.get(cur_path, 0) + 1
+                continue
+        total_added = sum(added_by_file.values())
+        touches_existing = any(p not in new_files for p in added_by_file)
+        if total_added < _SUBSTANTIAL_MIN_ADDED_LINES or not touches_existing:
+            return False
+        # already over-reaching? then let the checker fire (don't suppress).
+        if _scope_creep_reason(issue_text, patch_text) is not None:
+            return False
+        return True
+    except Exception:
+        return False
 
 
 def _repair_reason(repo_dir: str, patch_text: str, issue_text: str = "", check_tests: bool = True):
