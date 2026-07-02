@@ -1,10 +1,13 @@
-from __future__ import annotations
+"""The agent step loop: query the model, run one bash action, feed the
+observation back, finish when the agent echoes the completion sentinel.
+Uses a text-based action format.
+"""
+
 import re
 import time
 from dataclasses import dataclass, field
-from typing import List
 
-from .environment import compress_message_content, execute_command, truncate_text
+from .environment import execute_command, truncate_text
 from .model import ChatModel, ModelQueryError
 from .prompts import (
     COMPLETION_SENTINEL,
@@ -16,26 +19,17 @@ from .prompts import (
 from .repo_diff import collect_repo_patch
 
 _ACTION_BLOCK_RE = re.compile(r"```(?:bash|sh)?\s*\n(.*?)\n?```", re.DOTALL)
-_MAX_FORMAT_RETRIES = 3
-_RECENT_MESSAGES_FULL = 6
-_COMPRESS_TRIGGER_CHARS = 800
-_COMPRESSED_MESSAGE_CHARS = 1600
-_COMPRESSED_FLOOR_CHARS = 500
-_MIN_REST_MESSAGES = 4
-_KEYWORD_FILE_RE = re.compile(
-    r"`?([\w./-]+\.(?:py|ts|tsx|js|jsx|go|rs|java|cs|cpp|hpp|c|h|php|rb))\b`?",
+_ANY_FENCE_RE = re.compile(r"```[^\n`]*\n(.*?)\n?```", re.DOTALL)
+_DOLLAR_LINE_RE = re.compile(r"(?m)^\s*\$[ \t]+(\S.*?)\s*$")
+_READ_ONLY_COMMAND_RE = re.compile(
+    r"^\s*(?:cat|nl|head|tail|less|more|grep|rg|find|ls|tree|wc)\b",
     re.I,
 )
-_KEYWORD_SYMBOL_RE = re.compile(
-    r"`([A-Za-z_][\w.]*)`"
-    r"|\b([A-Z][a-zA-Z0-9]{2,})\b"
-    r"|\b([a-z][a-z0-9]*(?:_[a-z][a-z0-9_]+)+)\b",
-)
-_KEYWORD_SKIP = frozenset({
-    "the", "and", "for", "with", "from", "this", "that", "task", "issue", "file",
-    "files", "test", "tests", "class", "function", "method", "implement", "create",
-    "add", "fix", "update", "change", "remove", "delete", "ensure", "make", "use",
-})
+_MAX_FORMAT_RETRIES = 3
+_NO_PATCH_NUDGE_STEP = 4
+_RECENT_MESSAGE_COUNT = 8
+_COMPACT_MESSAGE_CHARS = 1200
+_MIN_COMPACT_MESSAGE_CHARS = 600
 
 
 @dataclass
@@ -49,8 +43,7 @@ class AgentRunConfig:
     max_tokens: int = 8192
     max_observation_chars: int = 16000
     max_log_chars: int = 260000
-    max_message_chars: int = 120000
-    issue_text: str = ""
+    max_message_chars: int = 90000
     wall_clock_limit: float = 0.0
 
 
@@ -64,32 +57,6 @@ class AgentOutcome:
     message: str
     exit_status: str = "Submitted"
     transcript: list = field(default_factory=list)
-
-
-def extract_task_keywords(task_text: str, limit: int = 8) -> List[str]:
-    """Symbol-like terms from the issue for message compression."""
-    seen: List[str] = []
-    for match in _KEYWORD_FILE_RE.finditer(task_text or ""):
-        path = match.group(1).strip().lstrip("./")
-        base = path.rsplit("/", 1)[-1]
-        for term in (path, base, base.rsplit(".", 1)[0] if "." in base else base):
-            low = term.lower()
-            if low in _KEYWORD_SKIP or len(low) < 3:
-                continue
-            if low not in seen:
-                seen.append(low)
-            if len(seen) >= limit:
-                return seen
-    for match in _KEYWORD_SYMBOL_RE.finditer(task_text or ""):
-        term = next(g for g in match.groups() if g)
-        low = term.lower()
-        if low in _KEYWORD_SKIP or len(low) < 3:
-            continue
-        if low not in seen:
-            seen.append(low)
-        if len(seen) >= limit:
-            break
-    return seen
 
 
 def run_agent_loop(*, config: AgentRunConfig, task: str) -> AgentOutcome:
@@ -108,14 +75,14 @@ def run_agent_loop(*, config: AgentRunConfig, task: str) -> AgentOutcome:
     exit_status = "LimitsExceeded"
     message = f"step limit of {config.max_steps} reached"
     format_retries = 0
-    task_keywords = extract_task_keywords(config.issue_text)
+    no_patch_nudge_sent = False
 
     for step in range(1, max(1, config.max_steps) + 1):
         if 0 < config.wall_clock_limit <= time.monotonic() - started:
             exit_status = "TimeExceeded"
             message = f"wall clock limit of {config.wall_clock_limit:.0f}s reached"
             break
-        messages[:] = _cap_messages(messages, config.max_message_chars, task_keywords)
+        messages = _cap_messages(messages, max_chars=config.max_message_chars)
         try:
             reply = model.query(messages)
         except ModelQueryError as exc:
@@ -126,9 +93,8 @@ def run_agent_loop(*, config: AgentRunConfig, task: str) -> AgentOutcome:
         messages.append({"role": "assistant", "content": reply})
         log_lines.append(f"[step {step}] assistant:\n{reply}")
 
-        actions = _ACTION_BLOCK_RE.findall(reply)
-        commands = [action.strip() for action in actions if action.strip()]
-        if len(commands) != 1:
+        command = _parse_single_command(reply)
+        if command is None:
             format_retries += 1
             if format_retries > _MAX_FORMAT_RETRIES:
                 exit_status = "FormatError"
@@ -138,21 +104,45 @@ def run_agent_loop(*, config: AgentRunConfig, task: str) -> AgentOutcome:
             log_lines.append(f"[step {step}] format retry {format_retries}")
             continue
         format_retries = 0
-        command = commands[0]
 
-        result = execute_command(command, cwd=config.repo_dir, timeout=config.command_timeout)
-        output_text = result.get("output") or ""
+        if _should_reject_read_only_command(
+            command=command,
+            repo_dir=config.repo_dir,
+            no_patch_nudge_sent=no_patch_nudge_sent,
+        ):
+            output_text = _read_budget_message(command)
+            returncode = 2
+            log_lines.append(f"[step {step}] read-only command rejected after no-patch nudge")
+        else:
+            result = execute_command(command, cwd=config.repo_dir, timeout=config.command_timeout)
+            output_text = result.get("output") or ""
+            returncode = result.get("returncode")
         log_lines.append(f"[step {step}] $ {command}\n{truncate_text(output_text, 2000)}")
-        if _is_submission(output_text, result.get("returncode")):
+        if _is_submission(output_text, returncode):
+            if not collect_repo_patch(config.repo_dir).strip():
+                messages.append({"role": "user", "content": _empty_submit_guard_message()})
+                log_lines.append(f"[step {step}] empty submit rejected")
+                if not no_patch_nudge_sent:
+                    no_patch_nudge_sent = True
+                    messages.append({"role": "user", "content": _no_patch_nudge_message(step)})
+                continue
             exit_status = "Submitted"
             message = f"submitted after {step} step(s)"
             break
         observation = render_observation(
-            returncode=int(result.get("returncode") or 0),
+            returncode=int(returncode or 0),
             output_text=truncate_text(output_text, config.max_observation_chars),
             remaining_steps=config.max_steps - step,
         )
         messages.append({"role": "user", "content": observation})
+        if _should_send_no_patch_nudge(
+            step=step,
+            repo_dir=config.repo_dir,
+            already_sent=no_patch_nudge_sent,
+        ):
+            no_patch_nudge_sent = True
+            messages.append({"role": "user", "content": _no_patch_nudge_message(step)})
+            log_lines.append(f"[step {step}] no-patch progress nudge sent")
 
     patch = collect_repo_patch(config.repo_dir)
     logs = truncate_text("\n".join(log_lines), config.max_log_chars)
@@ -168,63 +158,138 @@ def run_agent_loop(*, config: AgentRunConfig, task: str) -> AgentOutcome:
     )
 
 
-def _message_chars(messages: list) -> int:
-    return sum(len(str(m.get("content") or "")) for m in messages)
-
-
-def _cap_messages(messages: list, max_chars: int, keywords: list[str]) -> list:
-    """Keep system + task; compress old turns in two passes; drop pairs last."""
-    if max_chars <= 0 or _message_chars(messages) <= max_chars:
-        return messages
-    if len(messages) <= 2:
-        return messages
-
-    pinned = [{**m} for m in messages[:2]]
-    rest = [{**m, "content": str(m.get("content") or "")} for m in messages[2:]]
-
-    recent_start = max(0, len(rest) - _RECENT_MESSAGES_FULL)
-    compressed_pass: dict[int, int] = {}
-
-    while rest and _message_chars(pinned + rest) > max_chars:
-        compress_idx = None
-        best_len = 0
-        for idx in range(recent_start):
-            content = rest[idx]["content"]
-            clen = len(content)
-            if clen <= _COMPRESSED_FLOOR_CHARS:
-                continue
-            passes = compressed_pass.get(idx, 0)
-            if passes == 0 and clen <= _COMPRESS_TRIGGER_CHARS:
-                continue
-            limit = _COMPRESSED_MESSAGE_CHARS if passes == 0 else _COMPRESSED_FLOOR_CHARS
-            if clen > limit and clen > best_len:
-                best_len = clen
-                compress_idx = idx
-
-        if compress_idx is not None:
-            passes = compressed_pass.get(compress_idx, 0)
-            limit = _COMPRESSED_MESSAGE_CHARS if passes == 0 else _COMPRESSED_FLOOR_CHARS
-            content = rest[compress_idx]["content"]
-            shrunk = compress_message_content(content, keywords=keywords, limit=limit)
-            if shrunk != content:
-                rest[compress_idx] = {**rest[compress_idx], "content": shrunk}
-                compressed_pass[compress_idx] = passes + 1
-                continue
-
-        if len(rest) <= _MIN_REST_MESSAGES:
-            break
-
-        if (
-            len(rest) >= 2
-            and rest[0].get("role") == "assistant"
-            and rest[1].get("role") == "user"
-        ):
-            rest = rest[2:]
-        else:
-            rest = rest[1:]
-    return pinned + rest
-
-
 def _is_submission(output_text: str, returncode) -> bool:
     lines = output_text.lstrip().splitlines()
     return bool(lines) and lines[0].strip() == COMPLETION_SENTINEL and not returncode
+
+
+def _parse_single_command(reply: str) -> str | None:
+    strict = [item.strip() for item in _ACTION_BLOCK_RE.findall(reply or "") if item.strip()]
+    if len(strict) == 1:
+        return strict[0]
+    if strict:
+        return None
+
+    fenced = [item.strip() for item in _ANY_FENCE_RE.findall(reply or "") if item.strip()]
+    if len(fenced) == 1:
+        return fenced[0]
+    if fenced:
+        return None
+
+    prompted = [item.strip() for item in _DOLLAR_LINE_RE.findall(reply or "") if item.strip()]
+    return prompted[0] if len(prompted) == 1 else None
+
+
+def _empty_submit_guard_message() -> str:
+    return (
+        "[Submit rejected: the repository has no changes on disk.]\n\n"
+        "Create or modify one real source file for this task, then submit again "
+        f"with `echo {COMPLETION_SENTINEL}`."
+    )
+
+
+def _no_patch_nudge_message(step: int) -> str:
+    return (
+        f"[Progress check: step {step} and the working tree is still empty.]\n\n"
+        "You have enough context to act. Use the next command to create or modify "
+        "the source file that owns the main requested behavior. Implement reachable "
+        "code for the core requirement before doing more broad exploration."
+    )
+
+
+def _should_send_no_patch_nudge(
+    *,
+    step: int,
+    repo_dir: str,
+    already_sent: bool,
+) -> bool:
+    if already_sent or collect_repo_patch(repo_dir).strip():
+        return False
+    return step >= _NO_PATCH_NUDGE_STEP
+
+
+def _should_reject_read_only_command(
+    *,
+    command: str,
+    repo_dir: str,
+    no_patch_nudge_sent: bool,
+) -> bool:
+    if not no_patch_nudge_sent or collect_repo_patch(repo_dir).strip():
+        return False
+    return _is_obvious_read_only_command(command)
+
+
+def _is_obvious_read_only_command(command: str) -> bool:
+    stripped = (command or "").strip()
+    if not stripped or _command_has_write_operator(stripped):
+        return False
+    return bool(_READ_ONLY_COMMAND_RE.match(stripped))
+
+
+def _command_has_write_operator(command: str) -> bool:
+    lowered = command.lower()
+    return any(
+        marker in lowered
+        for marker in (
+            " >",
+            ">>",
+            "sed -i",
+            "tee ",
+            "touch ",
+            "mv ",
+            "cp ",
+            "cat <<",
+        )
+    )
+
+
+def _read_budget_message(command: str) -> str:
+    return (
+        "[Read budget exhausted: command not run because the repository still has "
+        "no changes on disk.]\n\n"
+        f"Rejected read-only command: {command[:240]}\n\n"
+        "Use the next command to edit or create the source file that owns the main "
+        "requested behavior. If you need a multi-line edit, use a heredoc or a "
+        "short script that writes the target file."
+    )
+
+
+def _cap_messages(messages: list, *, max_chars: int) -> list:
+    if max_chars <= 0 or _messages_chars(messages) <= max_chars or len(messages) <= 2:
+        return list(messages)
+
+    pinned = list(messages[:2])
+    rest = list(messages[2:])
+    recent_count = min(len(rest), _RECENT_MESSAGE_COUNT)
+    older = rest[:-recent_count] if recent_count else rest
+    recent = rest[-recent_count:] if recent_count else []
+    capped = pinned + [_compact_message(item, _COMPACT_MESSAGE_CHARS) for item in older] + recent
+    if _messages_chars(capped) <= max_chars:
+        return capped
+
+    compacted_tail = [_compact_message(item, _MIN_COMPACT_MESSAGE_CHARS) for item in capped[2:]]
+    capped = pinned + compacted_tail
+    while len(capped) > 6 and _messages_chars(capped) > max_chars:
+        capped = pinned + capped[3:]
+    return capped
+
+
+def _messages_chars(messages: list) -> int:
+    return sum(len(str(item.get("role", ""))) + len(str(item.get("content", ""))) for item in messages)
+
+
+def _compact_message(message: dict, limit: int) -> dict:
+    content = str(message.get("content") or "")
+    if len(content) <= limit:
+        return dict(message)
+    return {**message, "content": _compact_text(content, limit)}
+
+
+def _compact_text(text: str, limit: int) -> str:
+    if limit <= 0 or len(text) <= limit:
+        return text
+    marker = "\n[... compacted older turn ...]\n"
+    room = max(1, limit - len(marker))
+    head = max(1, room // 2)
+    tail = max(1, room - head)
+    return text[:head] + marker + text[-tail:]
