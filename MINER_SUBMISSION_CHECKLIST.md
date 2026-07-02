@@ -41,7 +41,7 @@ The default endpoint is:
 https://ninja66.ai/api/submissions
 ```
 
-For local testing, pass `--api-url http://127.0.0.1:8066/api/submissions`.
+For local testing, pass `--api-url http://127.0.0.1:5000/submissions/create`.
 
 ## Before You Submit
 

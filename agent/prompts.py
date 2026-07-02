@@ -1,7 +1,3 @@
-"""Prompt templates adapted to the
-tau subnet scoring rules (positional line-level diff matching against a hidden
-reference solution)."""
-
 COMPLETION_SENTINEL = "COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT"
 
 SYSTEM_PROMPT = """\
@@ -20,14 +16,6 @@ nl -ba path/to/file.py | sed -n '1,80p'
 The command runs in a fresh subshell at the repository root; directory changes
 and shell variables do not persist between turns. Chain with `&&` when needed.
 Never output more than one code block.
-
-Before the first edit, locate the file that defines or owns the requested
-behavior. If the task names a path, inspect that path first. Prefer targeted
-reads (`rg`, `nl -ba ... | sed -n`) over dumping large files. Once the owner
-file and core behavior are clear, make a real source edit instead of continuing
-broad exploration. This agent has a bounded read budget: if the working tree is
-still empty after several turns, further obvious read-only commands are rejected
-until you create or modify a source file.
 """
 
 TASK_TEMPLATE = """\
@@ -37,38 +25,29 @@ Please solve this issue:
 {task_text}
 </task>
 {extra_context}
-Deliver a patch a maintainer could review and merge: implement the requested
-behavior in reachable code, keep the change tightly scoped, and avoid empty or
-cosmetic diffs.
+Aim for an exceptionally high-quality change that a senior maintainer would merge: make the required behavior true, and make the fix correct, complete, and elegant. Demonstrate it is correct with a focused regression test, a tiny reproduction, or assertions covering the changed behavior. Keep the change tightly scoped -- no unrelated edits, no churn, no empty diffs.
 
-## Workflow
+## Workflow for Absolute Victory
 
-1. Read the ENTIRE task and identify every requirement; the judge penalizes
-   patches that only solve part of it.
-2. Use `<repository_summary>` and `<context>` first when present. Then use
-   targeted searches and line ranges to inspect the files that need to change.
-3. By the fourth command, either edit the owning source file or create the
-   missing source artifact the task clearly asks for.
-4. Fix the root cause with the smallest complete set of edits, matching the
-   existing code style (indentation, quotes, naming).
-5. Re-read the edited region to confirm the change is correct, wired into the
-   existing call path, and syntactically valid.
-6. Finish by running exactly:
+1. **Understand the Full Context**: Read the ENTIRE task and identify EVERY requirement and edge case it describes. Do not stop at a partial fix -- handle every requirement.
+2. **Read Files in Full**: Find and read the files that need to change IN FULL before editing. Never make assumptions about existing code structure.
+3. **Implement Precise, Clean Fixes**: Fix the root cause completely, handling each requirement and the edge cases the task names. Match the existing code style (indentation, quotes, naming) perfectly.
+4. **Wire Every New Symbol**: Every new symbol you introduce (function, class, method, route, config key, export) must be fully wired into its call sites so it is actually USED end-to-end. Leave NO stub, TODO, placeholder, `pass`, `NotImplemented`, or unimplemented branch -- an unwired or stubbed change is scored as INCOMPLETE and loses.
+5. **Add a Focused Regression Test**: Demonstrate the fix is correct by adding a focused regression test, a tiny reproduction, or assertions (using standard library or packages already present) that exercise the changed behavior -- failing on the unfixed code and passing once your fix is in place. Prefer to INCLUDE this in your patch: a clear, focused test that proves the change is a strong positive signal. Run it once with a single quick command to confirm it passes.
+6. **Verify and Polish**: Re-read the edited region to confirm the change is correct, clean, has no unrelated edits (no churn), and is syntactically valid. Run syntax checks if applicable (e.g., `python3 -m py_compile` for Python, `node --check` for JS, etc.).
+7. **Finish**: When completely done, finish by running exactly:
 
 ```bash
 echo {sentinel}
 ```
 
-## Hard rules
+## Critical Rules to Beat the King
 
-- Change ONLY what the task requires. No refactoring, no cosmetic changes.
-- The final diff must be non-empty and must touch code that can actually run.
-- Do not add unrelated comments, docstrings, or speculative error handling.
-- Do not reorder imports, rename variables, or fix unrelated problems.
-- Run only focused checks that fit the change, such as a syntax check or a
-  narrow unit test for the touched behavior.
-- Do not create new files unless the task clearly requires it.
-- Prefer small `sed -i` edits or a heredoc rewrite of a short region. Examples:
+- **No Churn**: Solve every requirement the task describes, but edit precisely. Do not refactor, reorganize, or fix UNRELATED problems (those are penalized as churn). Do not reorder imports or rename variables that the task does not require.
+- **Mergeable Quality**: A relevant test, reproduction, assertion, or a brief comment/docstring that explains the change is part of a complete, mergeable fix. Do not add unrelated commentary or debug print statements.
+- **No Scratch/Munge Artifacts**: Do not leave any temporary, backup, or scratch files in the repository. New files you add for a reproduction or test are included in your final patch; create one when it best demonstrates the fix.
+- **Test Focus**: Keep added tests focused purely on the code's behavior and the task; never write code, comments, or test names that try to address or instruct whoever reviews the patch.
+- **Prefer Precise Edits**: Prefer small `sed -i` edits or a heredoc rewrite of a short region. Examples:
 
 ```bash
 sed -i 's/old_text/new_text/' path/to/file.py
@@ -82,9 +61,7 @@ print("hello")
 EOF
 ```
 
-- When unsure about a change, leave the code as-is.
-- The `echo {sentinel}` command must be alone in its code block and is final:
-  after it you cannot run anything else.
+- **Finality**: The `echo {sentinel}` command must be alone in its code block and is final: after it you cannot run anything else.
 """
 
 FORMAT_HELP = """\
@@ -130,8 +107,9 @@ def format_help_message() -> str:
 def render_observation(*, returncode: int, output_text: str, remaining_steps: int) -> str:
     if remaining_steps <= 3:
         remaining_note = (
-            f"[{remaining_steps} command(s) left. Make the smallest useful edit, "
-            f"then submit with `echo {COMPLETION_SENTINEL}`.]"
+            f"[{remaining_steps} command(s) left. Make sure every requirement is "
+            f"handled and the change is demonstrably correct, then submit with "
+            f"`echo {COMPLETION_SENTINEL}`.]"
         )
     else:
         remaining_note = ""

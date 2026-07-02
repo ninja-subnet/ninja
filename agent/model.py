@@ -1,8 +1,3 @@
-"""Minimal OpenAI-compatible chat client.
-Standard library only; the endpoint and token always come from the
-validator-managed proxy configuration passed into agent.solve().
-"""
-
 import json
 import time
 import urllib.error
@@ -12,6 +7,11 @@ _RETRYABLE_STATUS = {408, 409, 425, 429, 500, 502, 503, 504}
 
 
 class ModelQueryError(RuntimeError):
+    pass
+
+
+class _TransientContentError(ModelQueryError):
+    """A 200-OK reply that is unusable (no choices / no content / empty)."""
     pass
 
 
@@ -54,8 +54,16 @@ class ChatModel:
             except (urllib.error.URLError, TimeoutError, OSError) as exc:
                 last_error = f"{type(exc).__name__}: {exc}"
             else:
-                self.calls += 1
-                return self._extract_content(raw)
+                try:
+                    text = self._extract_content(raw)
+                except _TransientContentError as exc:
+                    # 200-OK but unusable (Google soft-empty/finish_reason=error):
+                    # fall through to the existing backoff and retry in-place
+                    # rather than forfeit the round.
+                    last_error = f"{type(exc).__name__}: {exc}"
+                else:
+                    self.calls += 1
+                    return text
             if attempt < self.max_attempts:
                 time.sleep(min(20.0, 1.5 ** attempt))
         raise ModelQueryError(f"model request failed after {self.max_attempts} attempts: {last_error}")
@@ -84,7 +92,7 @@ class ChatModel:
             self.completion_tokens += _as_int(usage.get("completion_tokens"))
         choices = payload.get("choices") if isinstance(payload, dict) else None
         if not isinstance(choices, list) or not choices:
-            raise ModelQueryError(f"model response has no choices: {raw[:300]}")
+            raise _TransientContentError(f"model response has no choices: {raw[:300]}")
         message = choices[0].get("message") if isinstance(choices[0], dict) else None
         content = message.get("content") if isinstance(message, dict) else None
         if isinstance(content, list):
@@ -92,7 +100,9 @@ class ChatModel:
                 str(part.get("text") or "") for part in content if isinstance(part, dict)
             )
         if not isinstance(content, str):
-            raise ModelQueryError(f"model response has no text content: {raw[:300]}")
+            raise _TransientContentError(f"model response has no text content: {raw[:300]}")
+        if not content.strip():
+            raise _TransientContentError(f"model returned empty content: {raw[:200]}")
         return content
 
 
