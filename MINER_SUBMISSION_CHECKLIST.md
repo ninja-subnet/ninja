@@ -38,7 +38,7 @@ Optional display username:
 The default endpoint is:
 
 ```text
-https://ninja66.ai/api/submissions
+https://ninja66.ai/submissions/create
 ```
 
 For local testing, pass `--api-url http://127.0.0.1:5000/submissions/create`.

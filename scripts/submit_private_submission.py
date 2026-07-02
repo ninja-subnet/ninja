@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any
 
 
-DEFAULT_API_URL = "https://api.ninja66.ai/submissions/create"
+DEFAULT_API_URL = "https://ninja66.ai/submissions/create"
 USER_AGENT = "ninja66-private-submission/3.0"
 MAX_TOTAL_BYTES = 5_000_000
 MAX_AGENT_FILES = 32
