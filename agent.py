@@ -238,10 +238,15 @@ def solve(
             max_message_chars=MAX_MESSAGE_CHARS,
             wall_clock_limit=WALL_CLOCK_LIMIT_SECONDS,
         )
-        outcome = run_agent_loop(
-            config=run_config,
-            task=build_initial_user_prompt(issue, repo_summary, preloaded_context),
-        )
+        task_prompt = build_initial_user_prompt(issue, repo_summary, preloaded_context)
+        try:
+            from agent.reroll import run_best_of_two
+        except Exception:
+            run_best_of_two = None
+        if run_best_of_two is not None:
+            outcome = run_best_of_two(run_config, task_prompt, issue)
+        else:
+            outcome = run_agent_loop(config=run_config, task=task_prompt)
         elapsed = time.monotonic() - started
         return {
             "patch": outcome.patch,
