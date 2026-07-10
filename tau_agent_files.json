@@ -2,9 +2,10 @@
   "agent.py",
   "agent/__init__.py",
   "agent/agent_loop.py",
+  "agent/companion.py",
   "agent/environment.py",
+  "agent/locate.py",
   "agent/model.py",
   "agent/prompts.py",
-  "agent/repo_diff.py",
-  "agent/reroll.py"
+  "agent/repo_diff.py"
 ]
