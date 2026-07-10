@@ -18,15 +18,6 @@ from .prompts import (
 )
 from .repo_diff import collect_repo_patch
 
-# Post-loop REMOVE-ONLY patch hygiene lives in agent/guard.py. The import is
-# caged so a missing/broken guard module degrades to EXACT crown_v2 behavior:
-# the fallback is a no-op, so the collected patch is byte-identical.
-try:
-    from .guard import remove_untracked_artifacts
-except Exception:  # pragma: no cover - the guard must never break the agent
-    def remove_untracked_artifacts(repo_dir):  # type: ignore[misc]
-        return None
-
 _ACTION_BLOCK_RE = re.compile(r"```(?:bash|sh)?\s*\n(.*?)\n?```", re.DOTALL)
 _ANY_FENCE_RE = re.compile(r"```[^\n`]*\n(.*?)\n?```", re.DOTALL)
 _DOLLAR_LINE_RE = re.compile(r"(?m)^\s*\$[ \t]+(\S.*?)\s*$")
@@ -153,9 +144,6 @@ def run_agent_loop(*, config: AgentRunConfig, task: str) -> AgentOutcome:
             messages.append({"role": "user", "content": _no_patch_nudge_message(step)})
             log_lines.append(f"[step {step}] no-patch progress nudge sent")
 
-    # REMOVE-ONLY hygiene BEFORE collection so the patch is free of leaked
-    # bytecode/cache churn. No-op on a clean tree -> byte-identical to crown_v2.
-    remove_untracked_artifacts(config.repo_dir)
     patch = collect_repo_patch(config.repo_dir)
     logs = truncate_text("\n".join(log_lines), config.max_log_chars)
     return AgentOutcome(
