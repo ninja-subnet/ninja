@@ -159,9 +159,98 @@ _TEST_PATH_RE = re.compile(
 
 _DEF_KEYWORDS = r"(?:def|class|func|function|interface|struct|type|const|let|var)"
 
+# --- BROADENED ERROR/LOG-MESSAGE anchors (string channel, additive) --------
+# An UNQUOTED exception tail the issue pastes bare / inside a ``` block / a log
+# dump:  ``SomeError: human readable message`` -- never harvested by the quote-
+# only extractor, so its owning raise site is invisible to crown_v2.
+_EXC_TAIL_RE = re.compile(
+    r"^[ \t]*([A-Za-z_][\w.]*(?:Error|Exception|Warning|Failure|Errno))"
+    r"[ \t]*:[ \t]*(\S.*)$",
+    re.M,
+)
+# Interpolated holes in a RENDERED/templated message; the static word-runs
+# BETWEEN them are what an f-string / %-format / .format() / concat raise site
+# literally contains, so stripping them lets a non-verbatim message still match.
+_FILLER_RE = re.compile(
+    r"'[^'\n]*'"                     # single-quoted interpolated value
+    r'|"[^"\n]*"'                    # double-quoted interpolated value
+    r"|\{[^{}\n]*\}"                # {}, {0}, {name!r}  (format / f-string holes)
+    r"|%[-#0-9.* ]*[sdrifgxeobc%]"   # %s %d %r %5.2f %% ...
+    r"|<[^<>\n]{0,40}>"             # <object ...> repr fragments
+    r"|\b0[xX][0-9A-Fa-f]+\b"       # hex addresses / ids
+    r"|\b\d[\w.]*\b"                # numbers / versions
+)
+# A message match is anchored ONLY when its physical line carries one of these
+# emit keywords -- i.e. it is a genuine raise/log/warn site, not a bare constant
+# assignment or a message-registry entry whose owning fix lives elsewhere.
+_EMIT_KW_RE = re.compile(
+    r"\b(?:raise|log|logger|logging|warn|warning|error|assert|return|print|"
+    r"fmt|sprintf|format|throw|panic|abort)\b",
+    re.I,
+)
+
 
 def _looks_like_test_path(rel: str) -> bool:
     return bool(_TEST_PATH_RE.search(rel.replace("\\", "/")))
+
+
+def _message_skeletons(msg: str) -> list:
+    """Maximal STATIC word-runs of a (possibly templated) error/log message.
+
+    Interpolated holes ('...'/"..."/{...}/%s/numbers/hex/<...>) are stripped and
+    each remaining run that is >= 12 chars AND >= 2 words is returned as a
+    shingle a raise/log site contains verbatim even when the RENDERED literal is
+    not a byte-exact substring of any source file. Deterministic (regex+split);
+    over-stripping only ever DROPS a shingle (fail toward silence), never invents
+    one, so it cannot widen the mislead surface beyond a real static phrase.
+    """
+    out: list = []
+    seen = set()
+    for run in _FILLER_RE.sub("\x00", msg or "").split("\x00"):
+        run = re.sub(r"\s+", " ", run).strip(" \t.,:;!?()[]{}<>-_/\\|=\"'`")
+        if len(run) < 12 or run.count(" ") < 1:  # < 12 chars or < 2 words
+            continue
+        key = run.lower()
+        if key not in seen:
+            seen.add(key)
+            out.append(run)
+    return out
+
+
+def _physical_line(text: str, idx: int) -> str:
+    a = text.rfind("\n", 0, idx) + 1
+    b = text.find("\n", idx)
+    return text[a: (b if b >= 0 else len(text))]
+
+
+def _in_string_literal_context(text: str, idx: int) -> bool:
+    """True when *idx* falls inside an OPEN string literal on its physical line
+    and is NOT preceded by a ``#`` comment marker. A deterministic left-to-right
+    single-line scan tracks quote open/close (honouring ``\\`` escapes) and bails
+    the moment a ``#`` is seen OUTSIDE a string, so a shingle can anchor a
+    raise/log STRING literal but never prose, a trailing ``# comment``, or a
+    quoted phrase that merely sits inside a comment (``# ... "phrase" ...``). This
+    is STRICTLY a subset of the old "any quote to the left" proxy -- an unclosed
+    quote implies a quote was seen -- so it can only ever REJECT more, never fire
+    where the old proxy stayed silent.
+    """
+    a = text.rfind("\n", 0, idx) + 1
+    quote = None
+    i = a
+    while i < idx:
+        c = text[i]
+        if quote is not None:
+            if c == "\\":
+                i += 2
+                continue
+            if c == quote:
+                quote = None
+        elif c == "#":
+            return False
+        elif c == "'" or c == '"' or c == "`":
+            quote = c
+        i += 1
+    return quote is not None
 
 
 def _norm_id(tok: str) -> str:
@@ -242,7 +331,32 @@ def _extract_anchors(issue: str):
     for raw, ln in _PATHLINE_RE.findall(issue or ""):
         add_frame(raw, ln)
 
-    return ids[:16], strs[:6], frames[:24]
+    # 5) BROADENED ERROR/LOG MESSAGES (skeleton-matched string channel). Sources
+    #    the verbatim tier drops: UNQUOTED exception tails, and MULTI-word single-
+    #    backtick spans. Quoted spans already in `strs` are ALSO fed here so a
+    #    TEMPLATED quoted message (verbatim-miss) still resolves by its static
+    #    skeleton. These anchors are PURELY additive: they only ever fill an
+    #    otherwise-EMPTY located context (see build_located_context), so on every
+    #    round crash/error-string/symbol already resolves the output is unchanged.
+    raw_msgs: list = []
+    for _q, body in _QUOTED_RE.findall(issue or ""):
+        raw_msgs.append(body)
+    for span in _BACKTICK_RE.findall(issue or ""):
+        s = span.strip()
+        if len(s) >= 12 and s.count(" ") >= 1:
+            raw_msgs.append(s)
+    for _exc, tail in _EXC_TAIL_RE.findall(issue or ""):
+        raw_msgs.append(tail)
+    msg_shingles: list = []
+    seen_sk = set()
+    for rm in raw_msgs:
+        for sk in _message_skeletons(rm):
+            k = sk.lower()
+            if k not in seen_sk:
+                seen_sk.add(k)
+                msg_shingles.append(sk)
+
+    return ids[:16], strs[:6], frames[:24], msg_shingles[:12]
 
 
 def _iter_source_files(repo_path: str, deadline: float):
@@ -349,8 +463,8 @@ def build_located_context(repo_path: str, issue: str) -> str:
     try:
         if not repo_path or not os.path.isdir(repo_path) or not issue or not issue.strip():
             return ""
-        id_anchors, str_anchors, crash_frames = _extract_anchors(issue)
-        if not id_anchors and not str_anchors and not crash_frames:
+        id_anchors, str_anchors, crash_frames, msg_shingles = _extract_anchors(issue)
+        if not id_anchors and not str_anchors and not crash_frames and not msg_shingles:
             return ""
 
         # One combined definition regex for all id anchors (single scan/file).
@@ -375,14 +489,16 @@ def build_located_context(repo_path: str, issue: str) -> str:
         id_def_files: dict[str, dict[str, int]] = {a: {} for a in id_anchors}
         id_mention_files: dict[str, dict[str, int]] = {a: {} for a in id_anchors}
         str_files: dict[str, dict[str, int]] = {a: {} for a in str_anchors}
+        msg_files: dict[str, dict[str, int]] = {sk: {} for sk in msg_shingles}
         all_rels: list[str] = []
         read_bytes = 0
 
         for rel, full in _iter_source_files(repo_path, deadline):
             all_rels.append(rel)
             # crash-frame resolution needs the file LIST only; content scan is for
-            # def/mention/error-string anchors. Skip the read when nothing to scan.
-            if def_re is None and not str_anchors:
+            # def/mention/error-string/message anchors. Skip the read when there
+            # is nothing to scan for in file CONTENT.
+            if def_re is None and not str_anchors and not msg_shingles:
                 if read_bytes >= _MAX_TOTAL_READ_BYTES or time.monotonic() >= deadline:
                     break
                 continue
@@ -405,6 +521,35 @@ def build_located_context(repo_path: str, issue: str) -> str:
                 if s in text and rel not in str_files[s]:
                     idx = text.find(s)
                     str_files[s][rel] = _line_of(text, idx)
+            # BROADENED message channel: resolve a static shingle to its owning
+            # raise/log EMIT site. Test files are excluded (the fix is at the impl
+            # raise site, never the test that merely asserts the string). To be
+            # recorded a match must BOTH (a) sit in string-literal context (never
+            # prose / a `# comment`) AND (b) sit on a raise/log/warn EMIT line --
+            # so a bare module-level constant (`MSG = "..."`) or a message-registry
+            # entry, whose owning fix lives elsewhere, never anchors this file
+            # (that is the i18n/constant decoy). A shingle with no string+emit
+            # occurrence here simply fails to resolve -> we degrade to the empty
+            # preload (crown_v2 behaviour), never to a non-emit guess. Bounded
+            # per-file scan (<= 40 candidate hits).
+            if msg_shingles and not _looks_like_test_path(rel):
+                for sk in msg_shingles:
+                    if rel in msg_files[sk] or sk not in text:
+                        continue
+                    start = 0
+                    scanned = 0
+                    while scanned < 40:
+                        i = text.find(sk, start)
+                        if i < 0:
+                            break
+                        scanned += 1
+                        start = i + len(sk)
+                        if not _in_string_literal_context(text, i):
+                            continue
+                        if not _EMIT_KW_RE.search(_physical_line(text, i)):
+                            continue
+                        msg_files[sk][rel] = _line_of(text, i)
+                        break
             if read_bytes >= _MAX_TOTAL_READ_BYTES or time.monotonic() >= deadline:
                 break
 
@@ -445,6 +590,22 @@ def build_located_context(repo_path: str, issue: str) -> str:
                     if r not in def_map
                 }
                 candidates.append(((1, _issue_pos(issue_lower, a), tier, a), a, "symbol", def_map, use_map))
+        # BROADENED ERROR-MESSAGE tier -- STRICTLY a fallback: it contributes
+        # candidates ONLY when crash/error-string/symbol produced NONE, so on
+        # every round crown_v2 already resolves anything the output is byte-
+        # identical (this tier can never displace or co-emit with a higher tier).
+        # It resolves an error/log message the higher tiers cannot: an unquoted
+        # traceback tail / log line / code-block message, or a TEMPLATED raise
+        # matched by its static skeleton. Same 1-2 non-test-file ceiling.
+        if not candidates and msg_shingles:
+            for sk in msg_shingles:
+                fmap = msg_files.get(sk, {})
+                n = len(fmap)
+                if 1 <= n <= _MAX_DEF_FILES:
+                    tier = 0 if n == 1 else 2
+                    candidates.append(
+                        ((1, _issue_pos(issue_lower, sk), tier, sk), sk, "error message", fmap, None)
+                    )
         if not candidates:
             return ""
         candidates.sort(key=lambda c: c[0])
@@ -549,6 +710,13 @@ def _note_for(role: str, anchor: str, line: int, *, paired: bool) -> str:
             f"line {line} (found by searching the repo). This is one relevant "
             f"location; the fix may be here or in code that uses it -- confirm "
             f"against the task before editing."
+        )
+    if role == "error message":
+        return (
+            f"NOTE: the task's error / log text matches a message emitted in this "
+            f"file near line {line} (found by searching the repo for its static "
+            f"wording). The fix is often at or just above this raise/log site, but "
+            f"may be in a caller -- confirm against the task before editing."
         )
     # error string
     return (

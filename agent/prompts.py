@@ -2,35 +2,7 @@
 tau subnet scoring rules (positional line-level diff matching against a hidden
 reference solution)."""
 
-import re
-
 COMPLETION_SENTINEL = "COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT"
-
-_NAMED_FILE_RE = re.compile(
-    r"`?([\w./-]+\.(?:py|ts|tsx|js|jsx|go|rs|java|cs|rb|php|vue|html|css|"
-    r"json|yaml|yml|md|cpp|h|c|hpp|toml|xml|sql|sh|txt))`?",
-    re.I,
-)
-_NAMED_SYMBOL_RE = re.compile(r"`([A-Za-z_][A-Za-z0-9_]{2,})`")
-
-
-def _named_requirements_block(task_text: str) -> str:
-    seen = set()
-    items = []
-    for match in _NAMED_FILE_RE.finditer(task_text):
-        token = match.group(1).strip().lstrip("./")
-        if token and token not in seen:
-            seen.add(token)
-            items.append(token)
-    for match in _NAMED_SYMBOL_RE.finditer(task_text):
-        token = match.group(1)
-        if token not in seen:
-            seen.add(token)
-            items.append(token)
-    if not items:
-        return ""
-    listed = ", ".join("`" + token + "`" for token in items)
-    return f"\nNamed requirements (address EACH in your final diff): {listed}.\n"
 
 SYSTEM_PROMPT = """\
 You are a precise software engineering agent that interacts with a computer
@@ -56,9 +28,6 @@ file and core behavior are clear, make a real source edit instead of continuing
 broad exploration. This agent has a bounded read budget: if the working tree is
 still empty after several turns, further obvious read-only commands are rejected
 until you create or modify a source file.
-
-Before submitting, verify every named requirement in the task is addressed in
-your final diff; if one is missing, implement it before you submit.
 """
 
 TASK_TEMPLATE = """\
@@ -67,7 +36,7 @@ Please solve this issue:
 <task>
 {task_text}
 </task>
-{extra_context}{named_requirements}
+{extra_context}
 Deliver a patch a maintainer could review and merge: implement the requested
 behavior in reachable code, keep the change tightly scoped, and avoid empty or
 cosmetic diffs.
@@ -159,7 +128,6 @@ def build_task_prompt(*, task_text: str, repo_summary: str = "", preloaded_conte
     return TASK_TEMPLATE.format(
         task_text=task_text.strip(),
         extra_context="".join(extra_parts),
-        named_requirements=_named_requirements_block(task_text),
         sentinel=COMPLETION_SENTINEL,
     )
 

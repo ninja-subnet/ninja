@@ -18,6 +18,15 @@ from .prompts import (
 )
 from .repo_diff import collect_repo_patch
 
+# Post-loop REMOVE-ONLY patch hygiene lives in agent/guard.py. The import is
+# caged so a missing/broken guard module degrades to EXACT crown_v2 behavior:
+# the fallback is a no-op, so the collected patch is byte-identical.
+try:
+    from .guard import remove_untracked_artifacts
+except Exception:  # pragma: no cover - the guard must never break the agent
+    def remove_untracked_artifacts(repo_dir):  # type: ignore[misc]
+        return None
+
 _ACTION_BLOCK_RE = re.compile(r"```(?:bash|sh)?\s*\n(.*?)\n?```", re.DOTALL)
 _ANY_FENCE_RE = re.compile(r"```[^\n`]*\n(.*?)\n?```", re.DOTALL)
 _DOLLAR_LINE_RE = re.compile(r"(?m)^\s*\$[ \t]+(\S.*?)\s*$")
@@ -27,8 +36,6 @@ _READ_ONLY_COMMAND_RE = re.compile(
 )
 _MAX_FORMAT_RETRIES = 3
 _NO_PATCH_NUDGE_STEP = 4
-_DEADLINE_NUDGE_SECONDS = 45.0
-_DEADLINE_NUDGE_MIN_WALL = 180.0
 _RECENT_MESSAGE_COUNT = 8
 _COMPACT_MESSAGE_CHARS = 1200
 _MIN_COMPACT_MESSAGE_CHARS = 600
@@ -78,7 +85,6 @@ def run_agent_loop(*, config: AgentRunConfig, task: str) -> AgentOutcome:
     message = f"step limit of {config.max_steps} reached"
     format_retries = 0
     no_patch_nudge_sent = False
-    deadline_nudge_sent = False
 
     for step in range(1, max(1, config.max_steps) + 1):
         if 0 < config.wall_clock_limit <= time.monotonic() - started:
@@ -146,17 +152,10 @@ def run_agent_loop(*, config: AgentRunConfig, task: str) -> AgentOutcome:
             no_patch_nudge_sent = True
             messages.append({"role": "user", "content": _no_patch_nudge_message(step)})
             log_lines.append(f"[step {step}] no-patch progress nudge sent")
-        if (
-            not deadline_nudge_sent
-            and config.wall_clock_limit >= _DEADLINE_NUDGE_MIN_WALL
-            and config.wall_clock_limit - (time.monotonic() - started)
-            <= _DEADLINE_NUDGE_SECONDS
-            and not collect_repo_patch(config.repo_dir).strip()
-        ):
-            deadline_nudge_sent = True
-            messages.append({"role": "user", "content": _deadline_wrapup_message()})
-            log_lines.append(f"[step {step}] deadline wrap-up nudge sent")
 
+    # REMOVE-ONLY hygiene BEFORE collection so the patch is free of leaked
+    # bytecode/cache churn. No-op on a clean tree -> byte-identical to crown_v2.
+    remove_untracked_artifacts(config.repo_dir)
     patch = collect_repo_patch(config.repo_dir)
     logs = truncate_text("\n".join(log_lines), config.max_log_chars)
     return AgentOutcome(
@@ -198,16 +197,6 @@ def _empty_submit_guard_message() -> str:
         "[Submit rejected: the repository has no changes on disk.]\n\n"
         "Create or modify one real source file for this task, then submit again "
         f"with `echo {COMPLETION_SENTINEL}`."
-    )
-
-
-def _deadline_wrapup_message() -> str:
-    return (
-        "[Deadline: under 45 seconds of wall clock remain and the working tree "
-        "still has no changes.]\n\n"
-        "Stop exploring. With your NEXT command make the smallest correct edit "
-        "that implements the most central named requirement, then submit with "
-        f"`echo {COMPLETION_SENTINEL}`."
     )
 
 

@@ -65,9 +65,18 @@ try:
 except Exception:  # pragma: no cover
     _build_located_context = None
 
-# Combined <context> budget (king named-file / located-def preload up to 8000
-# chars + companion up to 5000). Cap so the pinned first message stays lean.
-_MAX_COMBINED_PRELOAD_CHARS = 12000
+# Combined <context> ceiling. Sized ABOVE any reachable sum of the component
+# budgets INCLUDING their block wrappers/notes -- named-file baseline (8000
+# content + ~800 wrappers) + whole-block appendix (6000 content + ~800
+# wrappers) + companion (~5000 incl. wrappers); the primary slot holds EITHER
+# the named-file preload (with its optional whole-block appendix) OR the
+# located context (<=8000+wrappers), never both, and the companion block is
+# purely additive. Each injector already enforces its own budget, so this cap
+# NEVER truncates in practice: it is a defensive invariant (guards a
+# pathological oversized block), not an active truncator -- a whole-block
+# appendix can never be chopped mid-block by a co-firing companion. The pinned
+# first message stays far under the 90000-char message cap.
+_MAX_COMBINED_PRELOAD_CHARS = 24000
 
 # The def-site locate scan only runs in the generous-budget (live ~600s) regime,
 # where its ~6s pre-loop scan is negligible against the round budget. In a tight
@@ -204,9 +213,42 @@ def _repo_paths(repo_dir: str) -> list[str]:
 
 
 def issue_named_context(issue: str, repo_dir: str) -> str:
-    blocks: list[str] = []
+    """Preload the current content of files named by the task.
+
+    Whole-block-aware, STRICTLY ADDITIVE refinement of the baseline preload.
+    The baseline shows the TOP `budget` characters of each named file. When a
+    named file is larger than that budget, the baseline truncates away whatever
+    lives past the clip -- frequently the very function/class the task asks
+    about (owning block lives further down). This refinement keeps the baseline
+    clip byte-for-byte (so the model never sees LESS than the baseline) and,
+    only when the baseline truncated a def/class the task names, APPENDS the
+    complete text of that block so the model also gets a coherent view of the
+    code that owns the requested behavior. When nothing was truncated, or no
+    owning block can be confidently identified, the output is byte-for-byte
+    identical to the baseline; any error falls back to the baseline. This
+    changes only the model's input context; it never adds anything to the
+    produced diff, and its output always contains the baseline as an exact
+    prefix (it can only add context, never remove it).
+    """
+    try:
+        return _issue_named_context_focused(issue, repo_dir)
+    except Exception:
+        return _issue_named_context_baseline(issue, repo_dir)
+
+
+def _baseline_blocks(issue_text: str, repo_dir: str) -> Tuple[list, list]:
+    """King-identical preload blocks plus a per-file display record.
+
+    Returns (blocks, displayed): `"\\n".join(blocks)` is EXACTLY the baseline
+    preload string, and `displayed` is a list of (path, content, clip_len) for
+    each file the baseline actually showed, so the focused pass can tell what
+    the baseline truncated. This loop must stay byte-for-byte equivalent to the
+    historical baseline preload.
+    """
+    blocks: list = []
+    displayed: list = []
     used = 0
-    for path in _existing_issue_files(issue, repo_dir, limit=3):
+    for path in _existing_issue_files(issue_text, repo_dir, limit=3):
         content = _read_repo_file(repo_dir, path)
         if not content:
             continue
@@ -221,8 +263,256 @@ def issue_named_context(issue: str, repo_dir: str) -> str:
             f"FILE CONTENT:\n```\n{clipped}{suffix}\n```\n-----"
         )
         blocks.append(block)
+        displayed.append((path, content, len(clipped)))
         used += len(clipped)
+    return blocks, displayed
+
+
+def _issue_named_context_baseline(issue_text: str, repo_dir: str) -> str:
+    blocks, _ = _baseline_blocks(issue_text, repo_dir)
     return "\n".join(blocks)
+
+
+_APPENDIX_NOTE = (
+    "complete definition(s) of symbol(s) the task names that were truncated "
+    "from the clipped view above; shown here in full as extra context. Confirm "
+    "against the task and read the file directly if you need more."
+)
+
+
+def _issue_named_context_focused(issue_text: str, repo_dir: str) -> str:
+    """Baseline preload, plus an appendix of complete owning blocks it truncated.
+
+    The returned string is the baseline preload verbatim, optionally followed by
+    the complete def/class blocks the task names that the baseline clipped away.
+    It therefore always contains the baseline as an exact prefix -- the model
+    can never see less context than the baseline gives it.
+    """
+    blocks, displayed = _baseline_blocks(issue_text, repo_dir)
+    baseline_out = "\n".join(blocks)
+    symbols = _issue_symbols(issue_text)
+    if not symbols:
+        return baseline_out
+    appendix: list = []
+    extra_used = 0
+    for path, content, clip_len in displayed:
+        if len(content) <= clip_len:
+            continue  # the baseline already showed this file in full
+        room = _FOCUS_EXTRA_MAX_CHARS - extra_used
+        if room <= 200:
+            break
+        deep = _extract_truncated_owning_blocks(content, symbols, clip_len, room)
+        if not deep:
+            continue
+        appendix.append(
+            f"-----\nADDITIONAL CONTEXT FOR FILE: {path}\n"
+            f"NOTE: {_APPENDIX_NOTE}\n"
+            f"FILE CONTENT (continued):\n```\n{deep}\n```\n-----"
+        )
+        extra_used += len(deep)
+    if not appendix:
+        return baseline_out
+    if baseline_out:
+        return baseline_out + "\n" + "\n".join(appendix)
+    return "\n".join(appendix)
+
+
+_ISSUE_IDENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]{2,}")
+_BACKTICK_SPAN_RE = re.compile(r"`([^`]+)`")
+_CODE_TOKEN_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+_DEF_LINE_RE = re.compile(r"^([ \t]*)(?:async[ \t]+)?(?:def|class)[ \t]+([A-Za-z_][A-Za-z0-9_]*)")
+_MAX_BLOCK_LINES = 400
+_FOCUS_EXTRA_MAX_CHARS = 6000
+
+# A backtick span that is exactly one identifier, optionally with an empty call
+# suffix -- `parse_config` or `parse_config()`. Such a lone-identifier span is a
+# deliberate, unambiguous code reference and is trusted verbatim.
+_LONE_SYMBOL_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)(?:\(\s*\))?$")
+# An identifier written as a call head inside a larger expression span --
+# `x.get(` -> get, `parse_config(` -> parse_config.
+_CALL_HEAD_RE = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)[ \t]*\(")
+
+# Pronoun/receiver noise: appears as a dotted head but never names an owning
+# def/class worth surfacing.
+_NOISE_TOKENS = frozenset({"self", "cls"})
+
+# Ultra-generic accessor/verb heads. Even written with call syntax
+# (`settings.get(...)`) these collide with unrelated `def get`/`def set` blocks
+# in a large file, so they are never admitted from the bare or call-head paths.
+# Explicit snake_case/mixedCase names and lone-identifier backtick spans are
+# unaffected (a token like `get_value` still qualifies by its identifier shape,
+# and a deliberate lone `` `get` `` backtick is still honored).
+_GENERIC_ACCESSORS = frozenset({
+    "get", "set", "add", "pop", "put", "run", "save", "load", "call", "make",
+    "build", "update", "delete", "remove", "init", "parse", "read", "write",
+    "fetch", "create", "append", "insert", "send", "open", "close",
+})
+
+
+def _has_ident_shape(token: str) -> bool:
+    """True when the token is written like a code identifier: snake_case
+    (contains '_') or mixedCase (has both an upper- and a lower-case letter)."""
+    if "_" in token:
+        return True
+    return any(c.isupper() for c in token) and any(c.islower() for c in token)
+
+
+def _collect_backtick_symbols(span_text: str, out: set) -> None:
+    """Harvest symbols from one backtick span into `out`.
+
+    A lone-identifier span (`name` or `name()`) is an explicit reference and is
+    trusted verbatim when at least 3 characters. A larger expression span
+    (`settings.get('x')`, `a.b.c`) contributes only its identifier-shaped tokens
+    and its explicit, non-generic call heads (`x.get(` -> dropped as generic;
+    `x.parse_config(` -> parse_config), never bare dotted receivers/sub-words
+    like self/key/value.
+    """
+    stripped = span_text.strip()
+    lone = _LONE_SYMBOL_RE.match(stripped)
+    if lone:
+        name = lone.group(1)
+        if len(name) >= 3:
+            out.add(name)
+        return
+    for match in _CALL_HEAD_RE.finditer(span_text):
+        head = match.group(1)
+        if len(head) >= 3 and head not in _GENERIC_ACCESSORS:
+            out.add(head)
+    for token in _CODE_TOKEN_RE.findall(span_text):
+        if len(token) >= 3 and _has_ident_shape(token):
+            out.add(token)
+
+
+def _is_named_code_symbol(token: str, issue_text: str, start: int, end: int) -> bool:
+    """Admit a bare (non-backtick) prose token only as an unambiguous code
+    reference: an identifier shape (snake_case/mixedCase), or written as a
+    non-generic `name(` call. The loose length>=7 prose heuristic and the bare
+    dotted-adjacency branches are deliberately dropped -- they were the source
+    of unrelated-block mislead in the un-hardened filter.
+    """
+    if _has_ident_shape(token):
+        return True
+    if (
+        end < len(issue_text)
+        and issue_text[end] == "("
+        and token not in _GENERIC_ACCESSORS
+    ):
+        return True
+    return False
+
+
+def _issue_symbols(issue_text: str) -> "frozenset[str]":
+    """Code-shaped identifiers the task names, high precision.
+
+    Only unambiguous code references are admitted so ordinary prose cannot
+    surface an unrelated owning block:
+
+      * backtick spans go through `_collect_backtick_symbols` (lone identifier
+        trusted; a larger expression contributes only shaped tokens / call heads);
+      * bare prose tokens go through `_is_named_code_symbol` (identifier shape or
+        a non-generic `name(` call).
+
+    Generic accessor heads and pronoun receivers are excluded. This is strictly
+    a precision tightening of the historical filter: every token yielded here was
+    also yielded by that looser filter, so the whole-block appendix can only
+    shrink, never grow, relative to it. Because the refinement is additive,
+    dropping a stray symbol at worst forgoes one appended block; it never removes
+    baseline context.
+    """
+    if not issue_text:
+        return frozenset()
+    out: set = set()
+    for span in _BACKTICK_SPAN_RE.finditer(issue_text):
+        _collect_backtick_symbols(span.group(1), out)
+    for match in _ISSUE_IDENT_RE.finditer(issue_text):
+        token = match.group(0)
+        if _is_named_code_symbol(token, issue_text, match.start(), match.end()):
+            out.add(token)
+    out -= _NOISE_TOKENS
+    return frozenset(out)
+
+
+def _leading_indent(line: str) -> int:
+    expanded = line.expandtabs(4)
+    return len(expanded) - len(expanded.lstrip(" "))
+
+
+def _block_end(lines: list, start: int, indent: int) -> int:
+    end = start
+    total = len(lines)
+    cursor = start + 1
+    while cursor < total:
+        line = lines[cursor]
+        if line.strip() == "":
+            cursor += 1
+            continue
+        if _leading_indent(line) <= indent:
+            break
+        end = cursor
+        cursor += 1
+        if end - start >= _MAX_BLOCK_LINES:
+            break
+    return end
+
+
+def _extract_truncated_owning_blocks(
+    content: str, symbols: "frozenset[str]", clip_len: int, budget: int
+) -> str:
+    """Complete def/class blocks the task names that the baseline clip truncated.
+
+    Only blocks whose text extends past `clip_len` (i.e. the baseline did NOT
+    already show them in full) are emitted, in file order, each with a
+    `# lines A-B:` header. Returns "" when nothing qualifies, so the caller adds
+    no appendix and the preload stays byte-identical to the baseline.
+    """
+    if not symbols:
+        return ""
+    lines = content.splitlines()
+    starts: list = []  # approx char offset of each line start (exact for \n-only files)
+    pos = 0
+    for line in lines:
+        starts.append(pos)
+        pos += len(line) + 1
+    spans: list = []  # (start_index, end_index_inclusive)
+    for index, line in enumerate(lines):
+        match = _DEF_LINE_RE.match(line)
+        if not match or match.group(2) not in symbols:
+            continue
+        indent = _leading_indent(line)
+        end = _block_end(lines, index, indent)
+        end_offset = starts[end + 1] if end + 1 < len(starts) else pos
+        if end_offset <= clip_len:
+            continue  # the baseline clip already showed this block in full
+        spans.append((index, end))
+    if not spans:
+        return ""
+    spans.sort()
+    merged: list = []
+    for start, end in spans:
+        if merged and start <= merged[-1][1] + 1:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+    parts: list = []
+    total = 0
+    prev_end = -1
+    for start, end in merged:
+        if prev_end >= 0 and start > prev_end + 1:
+            parts.append("# ... (unrelated code omitted) ...")
+            total += 34
+        header = f"# lines {start + 1}-{end + 1}:"
+        segment = header + "\n" + "\n".join(lines[start : end + 1])
+        if total + len(segment) + 1 > budget:
+            if not parts:
+                room = budget - (len(header) + 2)
+                if room > 200:
+                    partial = "\n".join(lines[start : end + 1])[:room]
+                    parts.append(header + "\n" + partial + "\n# ... (block truncated) ...")
+            break
+        parts.append(segment)
+        total += len(segment) + 1
+        prev_end = end
+    return "\n".join(parts)
 
 
 def _existing_issue_files(issue: str, repo_dir: str, *, limit: int) -> list[str]:
@@ -245,11 +535,16 @@ def _read_repo_file(repo_dir: str, relative_path: str) -> str:
 
 
 def _fill_empty_with_located(preloaded_context: str, issue: str, repo_path: str) -> str:
-    """When the king's literal-named-file preload is EMPTY, fill that slot with
-    the DEFINITION site of a distinctive symbol/error-string the issue mentions
+    """When the literal-named-file preload is EMPTY, fill that slot with the
+    DEFINITION site of a distinctive symbol/error-string the issue mentions
     (high-precision, 1-2 files, or "" if ambiguous). Never displaces a named
-    file (only fires on the empty slot). Gated to the generous-budget regime.
-    Fail-open: any problem returns the base preload unchanged -> exact tie."""
+    file (only fires on the empty slot) -- and because the whole-block focused
+    preload is empty EXACTLY when the baseline named-file preload is empty
+    (its appendix only ever extends a non-empty baseline), this gate is
+    byte-equivalent to the king's empty-slot condition: the locate path and the
+    whole-block path are mutually exclusive by construction. Gated to the
+    generous-budget regime. Fail-open: any problem returns the base preload
+    unchanged -> exact tie."""
     if _build_located_context is None:
         return preloaded_context
     if WALL_CLOCK_LIMIT_SECONDS < _LOCATE_MIN_WALL_CLOCK_SECONDS:
@@ -266,10 +561,12 @@ def _fill_empty_with_located(preloaded_context: str, issue: str, repo_path: str)
 
 
 def _augment_with_companion(preloaded_context: str, issue: str, repo_path: str) -> str:
-    """Append the multi-site companion export block to the base named-file
-    context when a near-certain companion is detected. Additive (a multi-site
-    task may also name a file, so the base preload is kept) and hard-capped.
-    Fail-open: any problem returns the base preload unchanged -> exact tie."""
+    """Append the multi-site companion export block to the primary preload
+    (named-file/whole-block or located) when a near-certain companion is
+    detected. Additive (a multi-site task may also name a file, so the primary
+    preload is kept in full) and hard-capped by a defensive ceiling that is
+    never reached in normal operation. Fail-open: any problem returns the base
+    preload unchanged -> exact tie."""
     if _build_companion_context is None:
         return preloaded_context
     try:
@@ -302,7 +599,10 @@ def solve(
         preloaded_context = issue_named_context(issue, repo_path)
         # 1) Fill an EMPTY named-file slot with the located definition site
         #    (targets wrong-file cold-start). Keyed on the raw named context so a
-        #    later companion append cannot suppress it.
+        #    later companion append cannot suppress it. Mutually exclusive with
+        #    the whole-block appendix above: that appendix exists only when a
+        #    named file was preloaded (non-empty), and locate fires only when
+        #    nothing was preloaded (empty).
         preloaded_context = _fill_empty_with_located(preloaded_context, issue, repo_path)
         # 2) Additively append the multi-site companion export block when the
         #    issue adds a new public symbol (targets incomplete-multi-site).
