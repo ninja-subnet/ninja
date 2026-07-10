@@ -27,6 +27,8 @@ _READ_ONLY_COMMAND_RE = re.compile(
 )
 _MAX_FORMAT_RETRIES = 3
 _NO_PATCH_NUDGE_STEP = 4
+_DEADLINE_NUDGE_SECONDS = 45.0
+_DEADLINE_NUDGE_MIN_WALL = 180.0
 _RECENT_MESSAGE_COUNT = 8
 _COMPACT_MESSAGE_CHARS = 1200
 _MIN_COMPACT_MESSAGE_CHARS = 600
@@ -45,7 +47,6 @@ class AgentRunConfig:
     max_log_chars: int = 260000
     max_message_chars: int = 90000
     wall_clock_limit: float = 0.0
-    stub_monitor: object = None
 
 
 @dataclass
@@ -77,6 +78,7 @@ def run_agent_loop(*, config: AgentRunConfig, task: str) -> AgentOutcome:
     message = f"step limit of {config.max_steps} reached"
     format_retries = 0
     no_patch_nudge_sent = False
+    deadline_nudge_sent = False
 
     for step in range(1, max(1, config.max_steps) + 1):
         if 0 < config.wall_clock_limit <= time.monotonic() - started:
@@ -136,20 +138,24 @@ def run_agent_loop(*, config: AgentRunConfig, task: str) -> AgentOutcome:
             remaining_steps=config.max_steps - step,
         )
         messages.append({"role": "user", "content": observation})
-        tree_patch = collect_repo_patch(config.repo_dir)
-        if (not no_patch_nudge_sent and step >= _NO_PATCH_NUDGE_STEP
-                and not tree_patch.strip()):
+        if _should_send_no_patch_nudge(
+            step=step,
+            repo_dir=config.repo_dir,
+            already_sent=no_patch_nudge_sent,
+        ):
             no_patch_nudge_sent = True
             messages.append({"role": "user", "content": _no_patch_nudge_message(step)})
             log_lines.append(f"[step {step}] no-patch progress nudge sent")
-        if config.stub_monitor is not None:
-            try:
-                if config.stub_monitor(step, time.monotonic() - started, tree_patch):
-                    exit_status = "StubStuck"
-                    message = f"stub-stuck checkpoint reached at step {step}"
-                    break
-            except Exception:
-                pass
+        if (
+            not deadline_nudge_sent
+            and config.wall_clock_limit >= _DEADLINE_NUDGE_MIN_WALL
+            and config.wall_clock_limit - (time.monotonic() - started)
+            <= _DEADLINE_NUDGE_SECONDS
+            and not collect_repo_patch(config.repo_dir).strip()
+        ):
+            deadline_nudge_sent = True
+            messages.append({"role": "user", "content": _deadline_wrapup_message()})
+            log_lines.append(f"[step {step}] deadline wrap-up nudge sent")
 
     patch = collect_repo_patch(config.repo_dir)
     logs = truncate_text("\n".join(log_lines), config.max_log_chars)
@@ -192,6 +198,16 @@ def _empty_submit_guard_message() -> str:
         "[Submit rejected: the repository has no changes on disk.]\n\n"
         "Create or modify one real source file for this task, then submit again "
         f"with `echo {COMPLETION_SENTINEL}`."
+    )
+
+
+def _deadline_wrapup_message() -> str:
+    return (
+        "[Deadline: under 45 seconds of wall clock remain and the working tree "
+        "still has no changes.]\n\n"
+        "Stop exploring. With your NEXT command make the smallest correct edit "
+        "that implements the most central named requirement, then submit with "
+        f"`echo {COMPLETION_SENTINEL}`."
     )
 
 
