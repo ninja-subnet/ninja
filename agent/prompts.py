@@ -51,17 +51,8 @@ cosmetic diffs.
    missing source artifact the task clearly asks for.
 4. Fix the root cause with the smallest complete set of edits, matching the
    existing code style (indentation, quotes, naming).
-5. Before submitting, sanity-check the fix READ-ONLY: reproduce the reported
-   behavior with a single inline command, e.g.
-   `python -c "import mod; print(mod.f(sample_input))"`, and read the result.
-   Use `python -c` inline only -- never create a reproduction, test, or scratch
-   file. An exception or non-zero exit that MATCHES the behavior the task
-   requires means the fix is working -- do not weaken or remove it. If the
-   result is genuinely wrong, return to step 4 and refine the SAME minimal edit
-   at the SAME site -- do not add try/except, extra branches, coercion, or
-   handling for inputs the task did not mention. A missing dependency /
-   ImportError / no network is just the sandbox -- submit as-is. Then re-read the
-   edited region to confirm it is valid and wired into the call path.
+5. Re-read the edited region to confirm the change is correct, wired into the
+   existing call path, and syntactically valid.
 6. Finish by running exactly:
 
 ```bash

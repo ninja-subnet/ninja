@@ -40,40 +40,6 @@ from agent.agent_loop import AgentRunConfig, run_agent_loop
 from agent.prompts import build_task_prompt
 from agent.repo_diff import collect_repo_patch
 
-try:
-    # Multi-site COMPANION injector: when the issue ADDS a new public symbol
-    # and the package curates a public export surface (__all__ / re-exports)
-    # that does not yet list it, surface that export file as <context> so the
-    # model wires the new symbol into BOTH sites. High-precision + fail-open:
-    # if nothing qualifies (or on any error) it yields "" and the preload is
-    # byte-identical to the base, so a non-multi-site round is an exact tie.
-    from agent.companion import build_companion_context as _build_companion_context
-except Exception:  # pragma: no cover
-    _build_companion_context = None
-
-try:
-    # DEF-SITE LOCATOR: when the issue names NO owning file (king preload empty)
-    # but mentions a distinctive symbol/error-string that a high-precision repo
-    # scan resolves to 1-2 DEFINITION files, fill the empty <context> slot with
-    # that definition site so the deterministic model starts its trajectory from
-    # the true owning file instead of locking onto a decoy. Targets the king's
-    # AMBIGUOUS-COLD-START-LOCALIZATION wrong-file (~0) failure. Fires only when
-    # the named-file preload is empty AND the anchor resolves uniquely; otherwise
-    # returns "" -> byte-identical to the base. Runs once, before the loop, off
-    # the loop clock, hard-capped by a 6s scan budget. Fail-open import.
-    from agent.locate import build_located_context as _build_located_context
-except Exception:  # pragma: no cover
-    _build_located_context = None
-
-# Combined <context> budget (king named-file / located-def preload up to 8000
-# chars + companion up to 5000). Cap so the pinned first message stays lean.
-_MAX_COMBINED_PRELOAD_CHARS = 12000
-
-# The def-site locate scan only runs in the generous-budget (live ~600s) regime,
-# where its ~6s pre-loop scan is negligible against the round budget. In a tight
-# regime it is skipped, so the preload stays byte-identical to the base.
-_LOCATE_MIN_WALL_CLOCK_SECONDS = 400.0
-
 # -----------------------------
 # Config
 # -----------------------------
@@ -244,47 +210,6 @@ def _read_repo_file(repo_dir: str, relative_path: str) -> str:
         return ""
 
 
-def _fill_empty_with_located(preloaded_context: str, issue: str, repo_path: str) -> str:
-    """When the king's literal-named-file preload is EMPTY, fill that slot with
-    the DEFINITION site of a distinctive symbol/error-string the issue mentions
-    (high-precision, 1-2 files, or "" if ambiguous). Never displaces a named
-    file (only fires on the empty slot). Gated to the generous-budget regime.
-    Fail-open: any problem returns the base preload unchanged -> exact tie."""
-    if _build_located_context is None:
-        return preloaded_context
-    if WALL_CLOCK_LIMIT_SECONDS < _LOCATE_MIN_WALL_CLOCK_SECONDS:
-        return preloaded_context
-    if preloaded_context.strip():
-        return preloaded_context
-    try:
-        located = _build_located_context(repo_path, issue)
-    except Exception:
-        return preloaded_context
-    if located and located.strip():
-        return located
-    return preloaded_context
-
-
-def _augment_with_companion(preloaded_context: str, issue: str, repo_path: str) -> str:
-    """Append the multi-site companion export block to the base named-file
-    context when a near-certain companion is detected. Additive (a multi-site
-    task may also name a file, so the base preload is kept) and hard-capped.
-    Fail-open: any problem returns the base preload unchanged -> exact tie."""
-    if _build_companion_context is None:
-        return preloaded_context
-    try:
-        companion = _build_companion_context(repo_path, issue)
-    except Exception:
-        return preloaded_context
-    if not companion or not companion.strip():
-        return preloaded_context
-    if not preloaded_context.strip():
-        combined = companion
-    else:
-        combined = preloaded_context.rstrip() + "\n" + companion
-    return combined[:_MAX_COMBINED_PRELOAD_CHARS]
-
-
 def solve(
     repo_path: str,
     issue: str,
@@ -300,13 +225,6 @@ def solve(
         model_name, base_url, proxy_token = _resolve_inference_config(model, api_base, api_key)
         repo_summary = build_repo_summary(repo_path)
         preloaded_context = issue_named_context(issue, repo_path)
-        # 1) Fill an EMPTY named-file slot with the located definition site
-        #    (targets wrong-file cold-start). Keyed on the raw named context so a
-        #    later companion append cannot suppress it.
-        preloaded_context = _fill_empty_with_located(preloaded_context, issue, repo_path)
-        # 2) Additively append the multi-site companion export block when the
-        #    issue adds a new public symbol (targets incomplete-multi-site).
-        preloaded_context = _augment_with_companion(preloaded_context, issue, repo_path)
         run_config = AgentRunConfig(
             repo_dir=repo_path,
             model_name=model_name,
@@ -320,10 +238,15 @@ def solve(
             max_message_chars=MAX_MESSAGE_CHARS,
             wall_clock_limit=WALL_CLOCK_LIMIT_SECONDS,
         )
-        outcome = run_agent_loop(
-            config=run_config,
-            task=build_initial_user_prompt(issue, repo_summary, preloaded_context),
-        )
+        task_prompt = build_initial_user_prompt(issue, repo_summary, preloaded_context)
+        try:
+            from agent.reroll import run_best_of_two
+        except Exception:
+            run_best_of_two = None
+        if run_best_of_two is not None:
+            outcome = run_best_of_two(run_config, task_prompt, issue)
+        else:
+            outcome = run_agent_loop(config=run_config, task=task_prompt)
         elapsed = time.monotonic() - started
         return {
             "patch": outcome.patch,

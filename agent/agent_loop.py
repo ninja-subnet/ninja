@@ -45,6 +45,7 @@ class AgentRunConfig:
     max_log_chars: int = 260000
     max_message_chars: int = 90000
     wall_clock_limit: float = 0.0
+    stub_monitor: object = None
 
 
 @dataclass
@@ -135,14 +136,20 @@ def run_agent_loop(*, config: AgentRunConfig, task: str) -> AgentOutcome:
             remaining_steps=config.max_steps - step,
         )
         messages.append({"role": "user", "content": observation})
-        if _should_send_no_patch_nudge(
-            step=step,
-            repo_dir=config.repo_dir,
-            already_sent=no_patch_nudge_sent,
-        ):
+        tree_patch = collect_repo_patch(config.repo_dir)
+        if (not no_patch_nudge_sent and step >= _NO_PATCH_NUDGE_STEP
+                and not tree_patch.strip()):
             no_patch_nudge_sent = True
             messages.append({"role": "user", "content": _no_patch_nudge_message(step)})
             log_lines.append(f"[step {step}] no-patch progress nudge sent")
+        if config.stub_monitor is not None:
+            try:
+                if config.stub_monitor(step, time.monotonic() - started, tree_patch):
+                    exit_status = "StubStuck"
+                    message = f"stub-stuck checkpoint reached at step {step}"
+                    break
+            except Exception:
+                pass
 
     patch = collect_repo_patch(config.repo_dir)
     logs = truncate_text("\n".join(log_lines), config.max_log_chars)
