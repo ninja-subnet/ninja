@@ -39,7 +39,9 @@ Please solve this issue:
 {extra_context}
 Deliver a patch a maintainer could review and merge: implement every behavior
 the task asks for in reachable code, tightly scoped to the request, and never
-submit an empty or cosmetic diff.
+submit an empty or cosmetic diff. A partial patch that covers only the main
+happy path but misses named cases, files, or edge conditions will score far
+below a complete fix — treat every bullet and named file as mandatory.
 
 ## Workflow
 
@@ -49,15 +51,19 @@ submit an empty or cosmetic diff.
 2. Use `<repository_summary>` and `<context>` first when present, then use
    targeted searches and line ranges to find the file that owns each
    requirement.
-3. By the fourth command, make the first edit to the owning source file (or
+3. By the third command, make the first edit to the owning source file (or
    create the file the task clearly asks for). From then on spend your
    commands implementing, not exploring: do not re-read files you have
    already seen, other than a region you have just edited.
 4. Work through your requirement list one edit at a time until every item is
    implemented at the root cause, matching the existing code style
-   (indentation, quotes, naming). Do not stop at the first working state.
-5. Re-read each edited region once to confirm it is complete, syntactically
-   valid, and wired into the existing call path.
+   (indentation, quotes, naming). Run syntax and a quick runtime smoke check
+   (`python3 -c '...'` or repo tests); only submit after both pass.
+5. Run a quick syntax check on every file you edited (for example
+   `python3 -m py_compile path/to/file.py`, `node --check path/to/file.js`,
+   or `php -l path/to/file.php`), fix any errors, then re-read each edited
+   region once to confirm it is complete, syntactically valid, and wired into
+   the existing call path.
 6. Finish by running exactly:
 
 ```bash
@@ -94,9 +100,10 @@ EOF
 - Implement every behavior the task describes fully in reachable code before
   you submit: handle each case, input, and condition it names, not only the
   primary one.
-- Before submitting, check every requirement on your list against your diff;
-  if one is missing, implement it first. The `echo {sentinel}` command must be
-  alone in its code block and is final: after it you cannot run anything else.
+- Before submitting, check every requirement on your list and every acceptance
+  checklist item against your diff; if one is missing, implement it first. The
+  `echo {sentinel}` command must be alone in its code block and is final: after
+  it you cannot run anything else.
 """
 
 FORMAT_HELP = """\
@@ -139,14 +146,68 @@ def format_help_message() -> str:
     return FORMAT_HELP.format(sentinel=COMPLETION_SENTINEL) + "```\n"
 
 
-def render_observation(*, returncode: int, output_text: str, remaining_steps: int) -> str:
-    if remaining_steps <= 3:
+def render_observation(
+    *,
+    returncode: int,
+    output_text: str,
+    remaining_steps: int,
+    patch_text: str = "",
+    issue_text: str = "",
+    remaining_wall: float = 0.0,
+) -> str:
+    remaining_note = ""
+    checklist_note = ""
+    if patch_text.strip() and issue_text.strip():
+        try:
+            from agent.criteria import extract_criteria
+
+            criteria = extract_criteria(issue_text)
+            if criteria:
+                checklist_note = (
+                    "[Checklist: "
+                    + "; ".join(criteria[:4])
+                    + (" ..." if len(criteria) > 4 else "")
+                    + ". Submit when each item is implemented.]"
+                )
+        except Exception:
+            pass
+    if remaining_wall and 0 < remaining_wall <= 25 and patch_text.strip():
         remaining_note = (
-            f"[{remaining_steps} command(s) left. Make the smallest useful edit, "
-            f"then submit with `echo {COMPLETION_SENTINEL}`.]"
+            f"[About {remaining_wall:.0f}s of wall time remain. You have a diff on disk — "
+            f"verify checklist items, then submit with `echo {COMPLETION_SENTINEL}`.]"
         )
-    else:
-        remaining_note = ""
+    elif checklist_note:
+        remaining_note = checklist_note
+    elif remaining_wall and 0 < remaining_wall <= 50 and not patch_text.strip():
+        remaining_note = (
+            f"[About {remaining_wall:.0f}s of wall time remain and the tree is still empty. "
+            "Make one write to the owning source file next.]"
+        )
+    elif remaining_steps <= 6:
+        patch_lines = 0
+        if patch_text.strip():
+            patch_lines = sum(
+                1
+                for line in patch_text.splitlines()
+                if line.startswith(("+", "-")) and not line.startswith(("+++", "---"))
+            )
+        if patch_lines and patch_lines <= 14 and issue_text.strip():
+            remaining_note = (
+                f"[{remaining_steps} command(s) left. The diff is still small for this "
+                f"multi-part task — implement every remaining requirement in the owning "
+                f"source file(s), run a syntax check, then submit with "
+                f"`echo {COMPLETION_SENTINEL}`.]"
+            )
+        elif remaining_steps <= 3:
+            remaining_note = (
+                f"[{remaining_steps} command(s) left. Finish any missing requirements, "
+                f"then submit with `echo {COMPLETION_SENTINEL}`.]"
+            )
+        else:
+            remaining_note = (
+                f"[{remaining_steps} command(s) left. Verify every acceptance checklist "
+                f"item before submitting.]"
+            )
     return OBSERVATION_TEMPLATE.format(
         returncode=returncode,
         output=output_text,

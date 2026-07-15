@@ -10,7 +10,8 @@ from agent.prompts import build_task_prompt
 
 SUMMARY_ITEM_LIMIT = 400
 PRELOAD_MAX_CHARS = 8000
-PRELOAD_MAX_FILES = 2
+PRELOAD_MAX_FILES = 3
+PRELOAD_MAX_FILES_MULTI = 5
 
 _SKIP_DIR_NAMES = frozenset({
     ".git", "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache",
@@ -32,7 +33,10 @@ def build_context_task(issue, repo_dir):
     more = len(paths) - len(shown)
     note = "" if more <= 0 else f"\n... ({more} more items)"
     summary = ("\n".join(shown) + note) if shown else ""
-    preload = _issue_file_context(issue, repo_dir, paths)
+    named = _resolve_issue_files(issue, repo_dir, paths)
+    preload = _issue_file_context(issue, repo_dir, paths, named)
+    if len(named) != 1:
+        preload = _append_rg_context(issue, repo_dir, preload, max_hits=2 if len(named) >= 2 else 1)
     return build_task_prompt(task_text=(issue or "").strip(),
                              repo_summary=summary,
                              preloaded_context=preload)
@@ -54,9 +58,83 @@ def _repo_paths(repo_dir):
     return sorted(paths)
 
 
-def _issue_file_context(issue, repo_dir, paths):
+def _append_rg_context(issue, repo_dir, existing, max_hits=1):
+    if not issue or not repo_dir:
+        return existing
+    used = len(existing)
+    if used >= PRELOAD_MAX_CHARS - 500:
+        return existing
+    extra = []
+    for rel in _rg_owner_hits(issue, repo_dir, max_hits=max_hits):
+        if rel in existing:
+            continue
+        content = _read_file(repo_dir, rel)
+        if not content:
+            continue
+        room = PRELOAD_MAX_CHARS - used
+        if room <= 200:
+            break
+        clip = content[:room]
+        suffix = "\n... (truncated)" if len(content) > len(clip) else ""
+        extra.append(
+            f"-----\nFILE NAME: {rel}\n"
+            "NOTE: likely owner file from repository search; use it as context.\n"
+            f"FILE CONTENT:\n```\n{clip}{suffix}\n```\n-----"
+        )
+        used += len(clip)
+        if used >= PRELOAD_MAX_CHARS - 500:
+            break
+    if not extra:
+        return existing
+    return (existing + "\n" + "\n".join(extra)).strip()
+
+
+def _rg_owner_hits(issue, repo_dir, max_hits=2):
+    terms = _search_terms(issue)
+    if not terms:
+        return []
+    try:
+        import subprocess
+
+        proc = subprocess.run(
+            ["rg", "-l", terms[0], "--glob", "!{.git,node_modules,dist,build,target,vendor}/**"],
+            cwd=repo_dir,
+            text=True,
+            capture_output=True,
+            timeout=8,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return []
+    if proc.returncode not in (0, 1):
+        return []
+    out = []
+    for line in (proc.stdout or "").splitlines():
+        rel = line.strip().lstrip("./")
+        if rel and rel not in out:
+            out.append(rel)
+        if len(out) >= max_hits:
+            break
+    return out
+
+
+def _search_terms(issue):
+    terms = []
+    for m in re.finditer(r"`([A-Za-z_][\w.]*)`", issue or ""):
+        token = m.group(1)
+        if len(token) >= 3 and token not in terms:
+            terms.append(token)
+    for m in re.finditer(r"\b(?:class|function|def|method|module)\s+([A-Za-z_]\w+)", issue or "", re.I):
+        token = m.group(1)
+        if token not in terms:
+            terms.append(token)
+    return terms[:4]
+
+
+def _issue_file_context(issue, repo_dir, paths, named_files=None):
     blocks, used = [], 0
-    for rel in _resolve_issue_files(issue, repo_dir, paths):
+    file_limit = PRELOAD_MAX_FILES_MULTI if len(named_files or []) >= 2 else PRELOAD_MAX_FILES
+    for rel in (named_files or _resolve_issue_files(issue, repo_dir, paths))[:file_limit]:
         content = _read_file(repo_dir, rel)
         if not content:
             continue
@@ -81,6 +159,7 @@ def _resolve_issue_files(issue, repo_dir, paths):
         if not p.endswith("/"):
             by_base.setdefault(os.path.basename(p), []).append(p)
     out = []
+    file_limit = _file_limit_for_issue(issue)
     for m in _FILE_TOKEN_RE.finditer(issue or ""):
         rel = (m.group(1) or "").strip().lstrip("./")
         if not rel:
@@ -94,9 +173,18 @@ def _resolve_issue_files(issue, repo_dir, paths):
                 pick = hits[0]
         if pick and pick not in out:
             out.append(pick)
-        if len(out) >= PRELOAD_MAX_FILES:
+        if len(out) >= file_limit:
             break
     return out
+
+
+def _file_limit_for_issue(issue):
+    tokens = set()
+    for match in _FILE_TOKEN_RE.finditer(issue or ""):
+        rel = (match.group(1) or "").strip().lstrip("./")
+        if rel:
+            tokens.add(rel)
+    return PRELOAD_MAX_FILES_MULTI if len(tokens) >= 2 else PRELOAD_MAX_FILES
 
 
 def _read_file(repo_dir, rel):

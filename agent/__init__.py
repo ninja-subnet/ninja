@@ -1,7 +1,6 @@
 """Multi-file agent package for the tau subnet.
 
-The package provides the agent's building blocks: a model wrapper, a bash
-execution environment, prompt templates, and a step loop. Everything is
-standard-library only and all inference goes through the validator-managed
-OpenAI-compatible proxy passed into agent.solve().
+Invest v6: king #104 loop + completion pass, full submit gates, partial-submit
+rejection, extended repair/coverage checks, and budgeted recovery/repair in
+pipeline.py. Initial context is built once via context.py (not agent.py).
 """

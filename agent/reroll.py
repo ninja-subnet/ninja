@@ -1,6 +1,4 @@
-"""Primary-draw wrapper: rebuilds the initial prompt with a fuller repository
-summary and a selective issue-named-file preload, runs the base loop once for
-the full wall, and falls open to the on-disk diff on any error."""
+"""Primary-draw wrapper: rebuilds context + checklist, runs the base loop once."""
 
 from __future__ import annotations
 
@@ -8,6 +6,7 @@ import dataclasses
 
 from agent.agent_loop import AgentOutcome, run_agent_loop
 from agent.context import build_context_task
+from agent.criteria import extract_criteria, format_checklist
 from agent.repo_diff import collect_repo_patch
 
 
@@ -17,11 +16,16 @@ def run_best_of_two(base_config, task, issue_text) -> AgentOutcome:
     try:
         rebuilt = build_context_task(issue_text, repo)
         if rebuilt and "<task>" in rebuilt:
-            run_task = rebuilt
+            checklist = format_checklist(extract_criteria(issue_text))
+            run_task = rebuilt + checklist if checklist else rebuilt
     except Exception:
         run_task = task
+    run_config = dataclasses.replace(
+        base_config,
+        issue_text=issue_text or getattr(base_config, "issue_text", ""),
+    )
     try:
-        outcome = run_agent_loop(config=base_config, task=run_task)
+        outcome = run_agent_loop(config=run_config, task=run_task)
     except Exception:
         outcome = _floor_outcome(repo)
     return _outcome_on_disk(outcome, repo)
