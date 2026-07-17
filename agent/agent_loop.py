@@ -5,6 +5,8 @@ Uses a text-based action format.
 
 from __future__ import annotations
 
+import os
+
 import re
 import time
 from dataclasses import dataclass, field
@@ -40,6 +42,7 @@ _READ_REJECT_AFTER_STEP = 8
 _WRITE_NUDGE_WALL_SECONDS = 70.0
 _SUBMIT_NUDGE_WALL_SECONDS = 30.0
 _SUBMIT_AFTER_PATCH_STEPS = 4
+_ACE_MAX_ADDED_LINES = 15
 _SUBMIT_AFTER_PATCH_STEPS_VERIFIED = 2
 _POST_PATCH_READ_REJECT_WALL = 15.0
 _MODEL_ERROR_RETRIES = 1
@@ -78,6 +81,119 @@ class AgentOutcome:
     transcript: list = field(default_factory=list)
 
 
+
+def _guard_syntax_count(repo, patch_text):
+    import py_compile
+    bad, seen = 0, set()
+    for line in (patch_text or "").splitlines():
+        if line.startswith("+++ b/"):
+            rel = line[6:].strip()
+            if rel in seen or not rel.endswith(".py"):
+                continue
+            seen.add(rel)
+            try:
+                py_compile.compile(os.path.join(repo, rel), doraise=True)
+            except py_compile.PyCompileError:
+                bad += 1
+            except (OSError, ValueError):
+                pass
+    return bad
+
+
+def _guard_snapshot(repo, command, patch_text):
+    files = set()
+    for line in (patch_text or "").splitlines():
+        if line.startswith("+++ b/"):
+            files.add(line[6:].strip())
+    for tok in re.findall(r"[\w./-]+\.\w+", command or ""):
+        if os.path.isfile(os.path.join(repo, tok)):
+            files.add(tok)
+    snap = {}
+    for rel in files:
+        try:
+            with open(os.path.join(repo, rel), "rb") as fh:
+                snap[rel] = fh.read()
+        except OSError:
+            snap[rel] = None
+    return snap
+
+
+def _guard_restore(repo, snap):
+    import tempfile
+    for rel, data in snap.items():
+        p = os.path.join(repo, rel)
+        try:
+            if data is None:
+                if os.path.isfile(p):
+                    os.remove(p)
+            else:
+                d = os.path.dirname(p) or "."
+                fd, tmp = tempfile.mkstemp(dir=d)
+                with os.fdopen(fd, "wb") as h:
+                    h.write(data)
+                os.replace(tmp, p)
+        except OSError:
+            pass
+
+
+def _ace_ready(issue_text, patch_text):
+    """uid3's ace condition proxy: the FIRST code symbol named in the issue appears in the
+    added lines. When a runtime-verified patch already covers it, we are at the point uid3
+    would submit - and adding MORE past here is what breaks 0.9-scored solves down to 0.25."""
+    m = re.search(r"`([A-Za-z_][\w.]*)`", issue_text or "")
+    if not m:
+        return True
+    sym = m.group(1).split(".")[-1]
+    if len(sym) < 3:
+        return True
+    return _primary_symbol_in_scope(sym, patch_text or "")
+
+
+def _primary_symbol_in_scope(sym, patch_text):
+    """Scan added lines for the symbol; for a MINIMAL patch (<= _ACE_MAX_ADDED_LINES) also
+    scan the hunk context / @@ funcname header. The most common true-ace is a tiny in-place
+    edit to the BODY of the named function - the added '+' lines never repeat the function's
+    own name, so an added-only scan misses it and the ace-protection never fires -> over-work
+    -> 0.9->0.25. Widening to context ONLY for small patches catches the in-place ace without
+    matching sprawling multi-file over-work."""
+    word = re.compile(r"\b" + re.escape(sym) + r"\b")
+    added, hunk = [], []
+    for line in (patch_text or "").splitlines():
+        if line.startswith("+++") or line.startswith("---"):
+            continue
+        if line.startswith("+"):
+            added.append(line[1:])
+        elif line.startswith(" ") or line.startswith("@@"):
+            hunk.append(line)
+    if word.search("\n".join(added)):
+        return True
+    return len(added) <= _ACE_MAX_ADDED_LINES and bool(word.search("\n".join(hunk)))
+
+
+def _ace_submit_message(remaining_wall):
+    return (
+        "[Verified working fix in place.] You have a runtime-verified patch implementing the "
+        "primary requirement. On tasks where a small correct fix already works, ADDING more code "
+        "usually LOWERS the score by disturbing behaviour that was already correct. Submit NOW with "
+        f"`echo {COMPLETION_SENTINEL}` UNLESS a specific assertion in the preloaded test is clearly "
+        "still failing - if so, implement ONLY that one thing, then submit. Do not broaden the patch."
+    )
+
+
+def _revert_added_file(repo, rel):
+    import subprocess
+    try:
+        r = subprocess.run(["git", "-C", repo, "checkout", "HEAD", "--", rel],
+                           capture_output=True, timeout=15, check=False)
+        if r.returncode != 0:
+            try:
+                os.remove(os.path.join(repo, rel))
+            except OSError:
+                pass
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
 def run_agent_loop(*, config: AgentRunConfig, task: str) -> AgentOutcome:
     model = ChatModel(
         model_name=config.model_name,
@@ -100,8 +216,11 @@ def run_agent_loop(*, config: AgentRunConfig, task: str) -> AgentOutcome:
     submit_pressure_sent = False
     model_error_retries = 0
     steps_since_patch = 0
-    submit_ready_nudge_sent = False
+    submit_nudge_count = 0
     runtime_verified = False
+    _safe_snap = None
+    _safe_files = set()
+    _safe_patch = ""
 
     for step in range(1, max(1, config.max_steps) + 1):
         elapsed = time.monotonic() - started
@@ -159,15 +278,56 @@ def run_agent_loop(*, config: AgentRunConfig, task: str) -> AgentOutcome:
             returncode = 2
             log_lines.append(f"[step {step}] post-patch read-only command rejected")
         else:
+            _g_pre_patch = collect_repo_patch(config.repo_dir)
+            _g_pre_syn = _guard_syntax_count(config.repo_dir, _g_pre_patch) if _g_pre_patch.strip() else 0
+            _g_snap = _guard_snapshot(config.repo_dir, command, _g_pre_patch)
             result = execute_command(command, cwd=config.repo_dir, timeout=config.command_timeout)
             output_text = result.get("output") or ""
             returncode = result.get("returncode")
+            _g_post_patch = collect_repo_patch(config.repo_dir)
+            if _g_post_patch.strip():
+                _g_post_cnt = _guard_syntax_count(config.repo_dir, _g_post_patch)
+                if _g_post_cnt > _g_pre_syn:
+                    _guard_restore(config.repo_dir, _g_snap)
+                    output_text = ("[Edit auto-reverted: it left a NEW syntax error ("
+                                   + "%d file(s) now fail to compile" % _g_post_cnt
+                                   + "). The tree was restored to before this command. Re-apply the "
+                                   "change so every file stays syntactically valid.]")
+                    returncode = 1
+            _post = collect_repo_patch(config.repo_dir)
             if not returncode and command_is_runtime_verify(command):
-                patch = collect_repo_patch(config.repo_dir)
-                if patch.strip() and patch_passes_runtime(
-                    config.repo_dir, patch, config.issue_text
+                # EXPLICIT runtime-verify (unchanged cand_v13 behavior): the agent
+                # CHOSE to run a verify command, so a passing smoke both captures a
+                # salvage snapshot AND arms the submit-side signals via runtime_verified
+                # (ace-nudge, submit_after=2, adaptive coverage bar).
+                if _post.strip() and patch_passes_runtime(
+                    config.repo_dir, _post, config.issue_text
                 ):
                     runtime_verified = True
+                    _safe_snap = _guard_snapshot(config.repo_dir, "", _post)
+                    _safe_files = {ln[6:].strip() for ln in _post.splitlines()
+                                   if ln.startswith("+++ b/")}
+                    _safe_patch = _post
+            elif (
+                _post.strip()
+                and _post != _safe_patch
+                and not submit_readiness_light(config.repo_dir, _post)
+                and patch_passes_runtime(config.repo_dir, _post, config.issue_text)
+            ):
+                # PROACTIVE salvage snapshot (protection WITHOUT pressure): the tree
+                # reached a NEW non-empty lint-clean state that passes the runtime smoke,
+                # but the agent did NOT run a verify command. Capture a restore point for
+                # the wall-safe salvage so tasks the agent breaks before EVER self-verifying
+                # still fall back to a good state at the wall (cuts the uncaught 0.65->0.00
+                # catastrophic breaks). Crucially this does NOT set runtime_verified: the
+                # ace-nudge, submit_after timing, and adaptive submit bar stay exactly as in
+                # cand_v13, so it adds ZERO submit pressure and cannot force premature submit
+                # on hard tasks (avoids the cand_v14 recovery-collapse trap). The _post !=
+                # _safe_patch guard bounds the smoke to distinct new tree states only.
+                _safe_snap = _guard_snapshot(config.repo_dir, "", _post)
+                _safe_files = {ln[6:].strip() for ln in _post.splitlines()
+                               if ln.startswith("+++ b/")}
+                _safe_patch = _post
         log_lines.append(f"[step {step}] $ {command}\n{truncate_text(output_text, 2000)}")
         if _is_submission(output_text, returncode):
             patch = collect_repo_patch(config.repo_dir)
@@ -209,15 +369,17 @@ def run_agent_loop(*, config: AgentRunConfig, task: str) -> AgentOutcome:
         submit_after = (
             _SUBMIT_AFTER_PATCH_STEPS_VERIFIED if runtime_verified else _SUBMIT_AFTER_PATCH_STEPS
         )
+        _ace = bool(patch_now.strip()) and runtime_verified and _ace_ready(config.issue_text, patch_now)
         if (
             patch_now.strip()
-            and not submit_ready_nudge_sent
-            and steps_since_patch >= submit_after
+            and (submit_nudge_count == 0 or (_ace and submit_nudge_count < 3))
+            and steps_since_patch >= (1 if _ace else submit_after)
             and not submit_readiness_light(config.repo_dir, patch_now)
             and patch_passes_runtime(config.repo_dir, patch_now, config.issue_text)
         ):
-            submit_ready_nudge_sent = True
-            messages.append({"role": "user", "content": _submit_ready_nudge_message(remaining_wall)})
+            submit_nudge_count += 1
+            _msg = _ace_submit_message(remaining_wall) if _ace else _submit_ready_nudge_message(remaining_wall)
+            messages.append({"role": "user", "content": _msg})
             log_lines.append(f"[step {step}] submit-ready nudge sent")
         if (
             not collect_repo_patch(config.repo_dir).strip()
@@ -252,6 +414,20 @@ def run_agent_loop(*, config: AgentRunConfig, task: str) -> AgentOutcome:
             messages.append({"role": "user", "content": _strong_write_nudge_message(step)})
             log_lines.append(f"[step {step}] strong write nudge sent")
 
+    # WALL-SAFE SALVAGE: if the final tree is broken/empty but a runtime-verified
+    # good state was captured earlier, restore it. Over-work (or a wall kill mid-edit)
+    # that leaves a broken tree is the catastrophic 0.00-vs-uid3-ace loss; never ship
+    # worse than a verified-good patch. Do-no-harm: fires ONLY when the final is
+    # actually broken, so a genuinely-working refinement is never reverted.
+    if _safe_snap is not None:
+        _cur = collect_repo_patch(config.repo_dir)
+        _broken = (not _cur.strip()) or _guard_syntax_count(config.repo_dir, _cur) > 0 \
+            or not patch_passes_runtime(config.repo_dir, _cur, config.issue_text)
+        if _broken:
+            _cur_files = {ln[6:].strip() for ln in _cur.splitlines() if ln.startswith("+++ b/")}
+            for _rel in _cur_files - _safe_files:
+                _revert_added_file(config.repo_dir, _rel)
+            _guard_restore(config.repo_dir, _safe_snap)
     patch = collect_repo_patch(config.repo_dir)
     logs = truncate_text("\n".join(log_lines), config.max_log_chars)
     return AgentOutcome(
