@@ -293,31 +293,6 @@ def runtime_submit_guard_message(
     )
 
 
-_PRIMARY_COVER_MAX_ADDED_LINES = 15
-
-
-def _primary_symbol_covered(issue_text: str, patch_text: str) -> bool:
-    """True if the primary named requirement is implemented. Mirrors _ace_ready: scan added
-    lines, and for a MINIMAL patch also the hunk/@@-funcname context (catches an in-place edit
-    to the named function's body, where the added lines never repeat the function name). Must
-    stay in sync with agent_loop._primary_symbol_in_scope."""
-    symbols = _issue_symbols(issue_text)
-    if not symbols:
-        return True
-    word = re.compile(r"\b" + re.escape(symbols[0]) + r"\b")
-    added, hunk = [], []
-    for line in (patch_text or "").splitlines():
-        if line.startswith("+++") or line.startswith("---"):
-            continue
-        if line.startswith("+"):
-            added.append(line[1:])
-        elif line.startswith(" ") or line.startswith("@@"):
-            hunk.append(line)
-    if word.search("\n".join(added)):
-        return True
-    return len(added) <= _PRIMARY_COVER_MAX_ADDED_LINES and bool(word.search("\n".join(hunk)))
-
-
 def submit_readiness_for_submit(
     repo_dir: str,
     patch_text: str,
@@ -325,18 +300,11 @@ def submit_readiness_for_submit(
     *,
     runtime_verified: bool = False,
 ) -> Optional[str]:
-    light = submit_readiness_light(repo_dir, patch_text)
-    if light:
-        return light
-    # ADAPTIVE COVERAGE BAR: over-working a solve uid3 would already ACE is what
-    # breaks it (0.88->0.2 semantic regressions in live duels). Once the solution
-    # is runtime-verified AND the primary named requirement is implemented, submit
-    # at uid3 timing (=> ace TIE, not a loss). Tasks NOT yet runtime-verified (the
-    # ones uid3 tends to FAIL) still face the full ~half-symbols bar => recovery.
-    if not (runtime_verified and _primary_symbol_covered(issue_text, patch_text)):
-        crit = criteria_submit_message(issue_text, patch_text)
-        if crit:
-            return crit
+    blocked = submit_readiness_light(repo_dir, patch_text) or criteria_submit_message(
+        issue_text, patch_text
+    )
+    if blocked:
+        return blocked
     return runtime_submit_guard_message(
         repo_dir, patch_text, issue_text, runtime_verified=runtime_verified
     )

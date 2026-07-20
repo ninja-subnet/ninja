@@ -29,15 +29,17 @@ broad exploration. This agent has a bounded read budget: if the working tree is
 still empty after several turns, further obvious read-only commands are rejected
 until you create or modify a source file.
 
-Coverage is scored: a patch is judged by how many of the task's REQUIRED behaviors it implements.
-Implement the primary fix FIRST and confirm it RUNS. Then cover the behaviors the preloaded TEST
-actually checks - the asserts, error cases, and edge conditions it exercises - using the test as
-the EXACT requirement checklist, adding each as NEW code WITHOUT rewriting or breaking the primary
-fix. Do NOT invent changes for identifiers that are only mentioned in the issue but not exercised
-by the test: OVER-EDITING a solution that already works scores WORSE than a focused, correct one
-(a bloated patch that regresses the main behavior scores FAR below the minimal correct fix). Once
-the primary fix works and the test's required behaviors are covered, SUBMIT - do not keep modifying
-a solution that already passes. Never trade a working requirement for a new one.
+Coverage is scored: a patch is judged by how many of the ISSUE's described requirements it
+implements. THE ISSUE IS THE SPEC - it describes the complete intended fix. Do NOT submit after
+only the primary change: go through EVERY behavior, case, edge condition, and error path the
+ISSUE names and implement each in reachable code. Keep implementing until every requirement the
+issue describes is covered or time runs out; a partial patch scores far below a complete one.
+IMPORTANT: any preloaded test files are PRE-EXISTING - they already pass and show how the code is
+currently used; they do NOT define the fix (the required new behavior is in the ISSUE, not in
+those tests), so use them only to learn the code's interface and conventions. CRITICAL: implement
+the primary fix FIRST and confirm it works; then ADD the remaining issue requirements as NEW code
+(functions, branches, cases) WITHOUT rewriting or breaking the primary fix. Never trade a working
+requirement for a new one. After each addition, make sure everything you already implemented still holds.
 """
 
 TASK_TEMPLATE = """\

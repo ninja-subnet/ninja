@@ -1,3 +1,4 @@
+# rev c94c77
 """Initial-context builder: full repository summary plus a selective preload
 of files the issue names. Deterministic, read-only, standard library."""
 
@@ -25,18 +26,38 @@ _FILE_TOKEN_RE = re.compile(
 )
 
 
+def _extract_issue_requirements(issue):
+    """Distill the ISSUE (which describes the intended fix) into an explicit checklist of required
+    behaviors. The issue - not any pre-existing test - is the spec; surfacing its requirements
+    pushes COMPLETE coverage (the win-more axis). Bounded so the preload does not bloat."""
+    text = issue or ""
+    reqs, seen = [], set()
+    cue = re.compile(r"\b(should|must|need|returns?|raises?|handle|ensure|add|support|when|"
+                     r"default|fallback|instead|expected|error|invalid|empty|none|null|case|"
+                     r"edge|allow|reject|validate|correct|update|missing|otherwise)\b", re.I)
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        is_bullet = bool(re.match(r"^([-*+]|\d+[.)])\s+", line))
+        if (is_bullet or cue.search(line)) and 8 <= len(line) <= 200:
+            norm = re.sub(r"^([-*+]|\d+[.)])\s+", "", line)
+            key = norm.lower()
+            if key not in seen:
+                seen.add(key)
+                reqs.append(norm)
+        if len(reqs) >= 12:
+            break
+    return reqs
+
+
 def build_context_task(issue, repo_dir):
     if not repo_dir or not os.path.isdir(repo_dir):
         return ""
     paths = _repo_paths(repo_dir)
-    # Directory-only entries are redundant with the file paths that already reveal
-    # them; omit them from the model-visible summary to shrink the pinned prefix
-    # resent (at full prompt-token cost) every request. `paths` itself is untouched,
-    # so issue-file resolution and truncation stay identical.
-    file_paths = [p for p in paths if not p.endswith("/")]
-    shown = [p for p in paths[:SUMMARY_ITEM_LIMIT] if not p.endswith("/")]
-    more = len(file_paths) - len(shown)
-    note = "" if more <= 0 else f"\n... ({more} more files)"
+    shown = paths[:SUMMARY_ITEM_LIMIT]
+    more = len(paths) - len(shown)
+    note = "" if more <= 0 else f"\n... ({more} more items)"
     summary = ("\n".join(shown) + note) if shown else ""
     named = _resolve_issue_files(issue, repo_dir, paths)
     preload = _issue_file_context(issue, repo_dir, paths, named)
@@ -47,6 +68,11 @@ def build_context_task(issue, repo_dir):
         owner += [r for r in ranked if r not in owner]
         preload = _append_rg_context(issue, repo_dir, preload, max_hits=3)
     preload = _append_test_context(issue, repo_dir, preload, owner, terms)
+    _reqs = _extract_issue_requirements(issue)
+    if _reqs:
+        _rb = ("REQUIRED BEHAVIORS distilled from the ISSUE (the spec - implement EACH in reachable "
+               "code before submitting):\n" + "\n".join("  - " + r for r in _reqs))
+        preload = (_rb + "\n\n" + preload).strip() if preload else _rb
     return build_task_prompt(task_text=(issue or "").strip(),
                              repo_summary=summary,
                              preloaded_context=preload)
@@ -182,46 +208,8 @@ def _find_test_files(repo_dir, owner_files, terms, max_files=2):
     return [rel for rel, _ in ranked[:max_files]]
 
 
-_TEST_ASSERT_CALL_RE = re.compile(
-    r"\b(?:\w+\.)?assert[A-Za-z_]*\(|\b(?:\w+\.)?fail(?:Unless|If)[A-Za-z_]*\("
-)
-# Tests often define the target output in a named variable, then assert against it
-# (`expected = {...}` ... `assert got == expected`). The assert line alone hides the
-# concrete value; capturing the literal assignment surfaces the exact required output.
-_TEST_EXPECT_RE = re.compile(
-    r"^\s*[A-Za-z_]*(?:expected|wanted|want|golden|desired|EXPECTED)[A-Za-z_0-9]*\s*=\s*[\[{(\"'0-9tfrbN]"
-)
-
-
-def _extract_test_requirements(test_content):
-    reqs = []
-    for line in (test_content or "").splitlines():
-        st = line.strip()
-        if st.startswith(("def test_", "async def test_")):
-            name = st.split("(", 1)[0].replace("async ", "").replace("def ", "").strip()
-            reqs.append("behavior: " + name.replace("test_", "").replace("_", " "))
-        elif st.startswith("assert ") and len(st) < 200:
-            reqs.append(st)
-        elif "pytest.raises(" in st and len(st) < 200:
-            reqs.append(st)
-        elif _TEST_ASSERT_CALL_RE.search(st) and len(st) < 200:
-            reqs.append(st)
-        elif st.startswith("@") and "parametrize" in st and len(st) < 200:
-            reqs.append("cases: " + st)
-        elif _TEST_EXPECT_RE.match(line) and len(st) < 200:
-            reqs.append("expected value -> " + st)
-    seen, out = set(), []
-    for r in reqs:
-        if r not in seen:
-            seen.add(r)
-            out.append(r)
-        if len(out) >= 28:
-            break
-    return out
-
-
 def _append_test_context(issue, repo_dir, existing, owner_files, terms):
-    """Preload the top test file(s) exercising the owner code - the acceptance-criteria oracle."""
+    """Preload pre-existing test file(s) that exercise the owner code - USAGE context only (they do not define the fix; the ISSUE does)."""
     used = len(existing)
     if used >= PRELOAD_MAX_CHARS - 500:
         return existing
@@ -237,16 +225,12 @@ def _append_test_context(issue, repo_dir, existing, owner_files, terms):
             break
         clip = content[:room]
         suffix = "\n... (truncated)" if len(content) > len(clip) else ""
-        reqs = _extract_test_requirements(content)
-        req_block = ""
-        if reqs:
-            req_block = ("REQUIRED BEHAVIORS this test checks (implement EACH correctly):\n"
-                         + "\n".join(f"  - {r}" for r in reqs) + "\n")
         extra.append(
             f"-----\nFILE NAME: {rel}\n"
-            "NOTE: TEST file exercising the code above. It encodes the REQUIRED behavior / "
-            "acceptance criteria - implement everything needed to make ALL of it pass.\n"
-            f"{req_block}FILE CONTENT:\n```\n{clip}{suffix}\n```\n-----"
+            "NOTE: PRE-EXISTING test that exercises the code above (it already passes). It does "
+            "NOT define the fix - the required new behavior is described in the ISSUE, not here. "
+            "Use it only to learn the code's interface, conventions, and how it is called.\n"
+            f"FILE CONTENT:\n```\n{clip}{suffix}\n```\n-----"
         )
         used += len(clip)
         if used >= PRELOAD_MAX_CHARS - 500:

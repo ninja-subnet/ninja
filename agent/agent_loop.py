@@ -42,7 +42,6 @@ _READ_REJECT_AFTER_STEP = 8
 _WRITE_NUDGE_WALL_SECONDS = 70.0
 _SUBMIT_NUDGE_WALL_SECONDS = 30.0
 _SUBMIT_AFTER_PATCH_STEPS = 4
-_ACE_MAX_ADDED_LINES = 15
 _SUBMIT_AFTER_PATCH_STEPS_VERIFIED = 2
 _POST_PATCH_READ_REJECT_WALL = 15.0
 _MODEL_ERROR_RETRIES = 1
@@ -136,62 +135,126 @@ def _guard_restore(repo, snap):
             pass
 
 
-def _ace_ready(issue_text, patch_text):
-    """uid3's ace condition proxy: the FIRST code symbol named in the issue appears in the
-    added lines. When a runtime-verified patch already covers it, we are at the point uid3
-    would submit - and adding MORE past here is what breaks 0.9-scored solves down to 0.25."""
-    m = re.search(r"`([A-Za-z_][\w.]*)`", issue_text or "")
-    if not m:
-        return True
-    sym = m.group(1).split(".")[-1]
+def _reg_relevant_test(repo, issue):
+    """Find ONE pre-existing test file referencing the issue's primary symbol. It is GREEN at the
+    parent commit; if our edit makes it newly FAIL we broke existing behavior (a regression that
+    costs the exact 0.85->0.1 losses). Read-only rg."""
+    import subprocess
+    import re as _re
+    m = _re.search(r"`([A-Za-z_][\w.]*)`", issue or "")
+    sym = m.group(1).split(".")[-1] if m else ""
     if len(sym) < 3:
-        return True
-    return _primary_symbol_in_scope(sym, patch_text or "")
+        return None
+    try:
+        p = subprocess.run(["rg", "-l", "--no-messages", "-e", sym, "-g", "*test*.py"],
+                           cwd=repo, text=True, capture_output=True, timeout=6, check=False)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+    for line in (p.stdout or "").splitlines():
+        rel = line.strip().lstrip("./")
+        if rel and "test" in rel.lower():
+            return rel
+    return None
 
 
-def _primary_symbol_in_scope(sym, patch_text):
-    """Scan added lines for the symbol; for a MINIMAL patch (<= _ACE_MAX_ADDED_LINES) also
-    scan the hunk context / @@ funcname header. The most common true-ace is a tiny in-place
-    edit to the BODY of the named function - the added '+' lines never repeat the function's
-    own name, so an added-only scan misses it and the ace-protection never fires -> over-work
-    -> 0.9->0.25. Widening to context ONLY for small patches catches the in-place ace without
-    matching sprawling multi-file over-work."""
-    word = re.compile(r"\b" + re.escape(sym) + r"\b")
-    added, hunk = [], []
-    for line in (patch_text or "").splitlines():
-        if line.startswith("+++") or line.startswith("---"):
-            continue
-        if line.startswith("+"):
-            added.append(line[1:])
-        elif line.startswith(" ") or line.startswith("@@"):
-            hunk.append(line)
-    if word.search("\n".join(added)):
-        return True
-    return len(added) <= _ACE_MAX_ADDED_LINES and bool(word.search("\n".join(hunk)))
+def _reg_fail_count(repo, testfile):
+    """Run the pre-existing test file; return the number of FAILED tests, or None if the run is not
+    a reliable oracle (import/collection error, timeout, nothing ran) - in which case the guard stays
+    OFF (never blocks on an env problem). Byte-code + cache writes disabled so it cannot pollute the
+    patch."""
+    if not testfile:
+        return None
+    import os as _os
+    import subprocess
+    import re as _re
+    env = dict(_os.environ)
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+    try:
+        p = subprocess.run(
+            ["python3", "-m", "pytest", testfile, "-q", "--no-header",
+             "-p", "no:cacheprovider", "--import-mode=importlib", "-o", "addopts="],
+            cwd=repo, text=True, capture_output=True, timeout=25, check=False, env=env)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+    out = ((p.stdout or "") + (p.stderr or "")).lower()
+    if ("no tests ran" in out or "collected 0 items" in out
+            or "errors during collection" in out or "internalerror" in out
+            or "modulenotfounderror" in out or "importerror" in out
+            or "usage:" in out):
+        return None
+    mf = _re.search(r"(\d+) failed", out)
+    mp = _re.search(r"(\d+) passed", out)
+    if not mp and not mf:
+        return None
+    return int(mf.group(1)) if mf else 0
 
 
-def _ace_submit_message(remaining_wall):
+def _reg_regression_message(testfile, n):
     return (
-        "[Verified working fix in place.] You have a runtime-verified patch implementing the "
-        "primary requirement. On tasks where a small correct fix already works, ADDING more code "
-        "usually LOWERS the score by disturbing behaviour that was already correct. Submit NOW with "
-        f"`echo {COMPLETION_SENTINEL}` UNLESS a specific assertion in the preloaded test is clearly "
-        "still failing - if so, implement ONLY that one thing, then submit. Do not broaden the patch."
+        "[Regression guard: your change made %d previously-passing test(s) in %s FAIL.] " % (n, testfile)
+        + "You broke existing behavior that worked BEFORE your edit - that costs coverage points. Find "
+        "what your patch broke (`python3 -m pytest " + testfile + " -x -q`), fix the regression while "
+        "KEEPING your new behavior, then submit. Do NOT delete or weaken the test to pass."
     )
 
 
-def _revert_added_file(repo, rel):
+def _pf_static_errors(repo, patch):
+    """Static check the changed .py files for errors py_compile MISSES: undefined names, bad
+    references, import errors. These parse fine but break at runtime -> low judge score. Pure
+    do-no-harm loss-cut: catch them before submit so the agent fixes them. Fail-safe (skip on any
+    tooling issue); reports only genuine ERRORS, never unused-import style warnings."""
+    import os as _os
     import subprocess
+    files = [ln[6:].strip() for ln in patch.splitlines()
+             if ln.startswith("+++ b/") and ln.strip().endswith(".py")]
+    files = [x for x in files if x and _os.path.exists(_os.path.join(repo, x))]
+    if not files:
+        return None
     try:
-        r = subprocess.run(["git", "-C", repo, "checkout", "HEAD", "--", rel],
-                           capture_output=True, timeout=15, check=False)
-        if r.returncode != 0:
-            try:
-                os.remove(os.path.join(repo, rel))
-            except OSError:
-                pass
-    except (OSError, subprocess.SubprocessError):
-        pass
+        p = subprocess.run(["python3", "-m", "pyflakes"] + files, cwd=repo,
+                           capture_output=True, text=True, timeout=20, check=False)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+    out = (p.stdout or "") + (p.stderr or "")
+    bad = [ln for ln in out.splitlines()
+           if ("undefined name" in ln
+               or "invalid syntax" in ln
+               or "redefinition of unused" in ln
+               or ("import" in ln and "unused" not in ln and "unable" not in ln))]
+    if bad:
+        return ("[Static check FAILED - your patch will break when the code runs:]\n"
+                + "\n".join(bad[:8])
+                + "\nDefine or import the missing name(s) / fix the reference, then submit.")
+    return None
+
+
+def _noop_cosmetic_patch(repo, patch):
+    """Detect a patch that changes ONLY comments/whitespace/formatting - its AST is identical to the
+    parent, so it changes NO behavior and scores ~0. Rejecting it (to force a real edit) is strictly
+    do-no-harm. Only fires when EVERY changed file is .py AND every one is AST-identical to parent;
+    any non-.py change, any new file, or any AST difference => real change => allow. Fail-safe."""
+    import os as _os
+    import ast as _ast
+    import subprocess
+    files = [ln[6:].strip() for ln in patch.splitlines() if ln.startswith("+++ b/")]
+    files = [x for x in files if x]
+    if not files:
+        return None
+    if any(not x.endswith(".py") for x in files):
+        return None  # touched a non-python file -> treat as a real change
+    for x in files:
+        try:
+            cur = open(_os.path.join(repo, x)).read()
+            par = subprocess.run(["git", "-C", repo, "show", f"HEAD:{x}"],
+                                 capture_output=True, text=True, timeout=10, check=False).stdout
+            cur_ast = _ast.dump(_ast.parse(cur))
+            par_ast = _ast.dump(_ast.parse(par)) if par.strip() else ""
+        except (OSError, SyntaxError, ValueError, subprocess.SubprocessError):
+            return None  # cannot determine -> allow (fail-safe)
+        if cur_ast != par_ast:
+            return None  # a real code change exists -> allow
+    return ("[Your patch changes only comments or whitespace - it does not change any behavior, so it "
+            "cannot fix the issue.] Make a real source edit that implements the required behavior, then submit.")
 
 
 def run_agent_loop(*, config: AgentRunConfig, task: str) -> AgentOutcome:
@@ -216,11 +279,13 @@ def run_agent_loop(*, config: AgentRunConfig, task: str) -> AgentOutcome:
     submit_pressure_sent = False
     model_error_retries = 0
     steps_since_patch = 0
-    submit_nudge_count = 0
+    submit_ready_nudge_sent = False
     runtime_verified = False
-    _safe_snap = None
-    _safe_files = set()
-    _safe_patch = ""
+    _reg_testfile = _reg_relevant_test(config.repo_dir, config.issue_text)
+    _reg_baseline = _reg_fail_count(config.repo_dir, _reg_testfile) if _reg_testfile else None
+    _reg_rejects = 0
+    _pf_rejects = 0
+    _noop_rejects = 0
 
     for step in range(1, max(1, config.max_steps) + 1):
         elapsed = time.monotonic() - started
@@ -294,40 +359,12 @@ def run_agent_loop(*, config: AgentRunConfig, task: str) -> AgentOutcome:
                                    + "). The tree was restored to before this command. Re-apply the "
                                    "change so every file stays syntactically valid.]")
                     returncode = 1
-            _post = collect_repo_patch(config.repo_dir)
             if not returncode and command_is_runtime_verify(command):
-                # EXPLICIT runtime-verify (unchanged cand_v13 behavior): the agent
-                # CHOSE to run a verify command, so a passing smoke both captures a
-                # salvage snapshot AND arms the submit-side signals via runtime_verified
-                # (ace-nudge, submit_after=2, adaptive coverage bar).
-                if _post.strip() and patch_passes_runtime(
-                    config.repo_dir, _post, config.issue_text
+                patch = collect_repo_patch(config.repo_dir)
+                if patch.strip() and patch_passes_runtime(
+                    config.repo_dir, patch, config.issue_text
                 ):
                     runtime_verified = True
-                    _safe_snap = _guard_snapshot(config.repo_dir, "", _post)
-                    _safe_files = {ln[6:].strip() for ln in _post.splitlines()
-                                   if ln.startswith("+++ b/")}
-                    _safe_patch = _post
-            elif (
-                _post.strip()
-                and _post != _safe_patch
-                and not submit_readiness_light(config.repo_dir, _post)
-                and patch_passes_runtime(config.repo_dir, _post, config.issue_text)
-            ):
-                # PROACTIVE salvage snapshot (protection WITHOUT pressure): the tree
-                # reached a NEW non-empty lint-clean state that passes the runtime smoke,
-                # but the agent did NOT run a verify command. Capture a restore point for
-                # the wall-safe salvage so tasks the agent breaks before EVER self-verifying
-                # still fall back to a good state at the wall (cuts the uncaught 0.65->0.00
-                # catastrophic breaks). Crucially this does NOT set runtime_verified: the
-                # ace-nudge, submit_after timing, and adaptive submit bar stay exactly as in
-                # cand_v13, so it adds ZERO submit pressure and cannot force premature submit
-                # on hard tasks (avoids the cand_v14 recovery-collapse trap). The _post !=
-                # _safe_patch guard bounds the smoke to distinct new tree states only.
-                _safe_snap = _guard_snapshot(config.repo_dir, "", _post)
-                _safe_files = {ln[6:].strip() for ln in _post.splitlines()
-                               if ln.startswith("+++ b/")}
-                _safe_patch = _post
         log_lines.append(f"[step {step}] $ {command}\n{truncate_text(output_text, 2000)}")
         if _is_submission(output_text, returncode):
             patch = collect_repo_patch(config.repo_dir)
@@ -348,6 +385,29 @@ def run_agent_loop(*, config: AgentRunConfig, task: str) -> AgentOutcome:
                 messages.append({"role": "user", "content": blocked})
                 log_lines.append(f"[step {step}] submit quality guard rejected")
                 continue
+            if _reg_baseline is not None and _reg_rejects < 2 and remaining_wall > 65:
+                _reg_now = _reg_fail_count(config.repo_dir, _reg_testfile)
+                if _reg_now is not None and _reg_now > _reg_baseline:
+                    _reg_rejects += 1
+                    messages.append({"role": "user",
+                                     "content": _reg_regression_message(_reg_testfile, _reg_now - _reg_baseline)})
+                    log_lines.append(f"[step {step}] regression guard: {_reg_now - _reg_baseline} "
+                                     f"new failure(s) in {_reg_testfile}")
+                    continue
+            if _noop_rejects < 2 and remaining_wall > 55:
+                _noop_msg = _noop_cosmetic_patch(config.repo_dir, patch)
+                if _noop_msg:
+                    _noop_rejects += 1
+                    messages.append({"role": "user", "content": _noop_msg})
+                    log_lines.append(f"[step {step}] no-op cosmetic patch rejected")
+                    continue
+            if _pf_rejects < 2 and remaining_wall > 55:
+                _pf_msg = _pf_static_errors(config.repo_dir, patch)
+                if _pf_msg:
+                    _pf_rejects += 1
+                    messages.append({"role": "user", "content": _pf_msg})
+                    log_lines.append(f"[step {step}] static-error guard rejected submit")
+                    continue
             exit_status = "Submitted"
             message = f"submitted after {step} step(s)"
             break
@@ -369,17 +429,15 @@ def run_agent_loop(*, config: AgentRunConfig, task: str) -> AgentOutcome:
         submit_after = (
             _SUBMIT_AFTER_PATCH_STEPS_VERIFIED if runtime_verified else _SUBMIT_AFTER_PATCH_STEPS
         )
-        _ace = bool(patch_now.strip()) and runtime_verified and _ace_ready(config.issue_text, patch_now)
         if (
             patch_now.strip()
-            and (submit_nudge_count == 0 or (_ace and submit_nudge_count < 3))
-            and steps_since_patch >= (1 if _ace else submit_after)
+            and not submit_ready_nudge_sent
+            and steps_since_patch >= submit_after
             and not submit_readiness_light(config.repo_dir, patch_now)
             and patch_passes_runtime(config.repo_dir, patch_now, config.issue_text)
         ):
-            submit_nudge_count += 1
-            _msg = _ace_submit_message(remaining_wall) if _ace else _submit_ready_nudge_message(remaining_wall)
-            messages.append({"role": "user", "content": _msg})
+            submit_ready_nudge_sent = True
+            messages.append({"role": "user", "content": _submit_ready_nudge_message(remaining_wall)})
             log_lines.append(f"[step {step}] submit-ready nudge sent")
         if (
             not collect_repo_patch(config.repo_dir).strip()
@@ -414,20 +472,6 @@ def run_agent_loop(*, config: AgentRunConfig, task: str) -> AgentOutcome:
             messages.append({"role": "user", "content": _strong_write_nudge_message(step)})
             log_lines.append(f"[step {step}] strong write nudge sent")
 
-    # WALL-SAFE SALVAGE: if the final tree is broken/empty but a runtime-verified
-    # good state was captured earlier, restore it. Over-work (or a wall kill mid-edit)
-    # that leaves a broken tree is the catastrophic 0.00-vs-uid3-ace loss; never ship
-    # worse than a verified-good patch. Do-no-harm: fires ONLY when the final is
-    # actually broken, so a genuinely-working refinement is never reverted.
-    if _safe_snap is not None:
-        _cur = collect_repo_patch(config.repo_dir)
-        _broken = (not _cur.strip()) or _guard_syntax_count(config.repo_dir, _cur) > 0 \
-            or not patch_passes_runtime(config.repo_dir, _cur, config.issue_text)
-        if _broken:
-            _cur_files = {ln[6:].strip() for ln in _cur.splitlines() if ln.startswith("+++ b/")}
-            for _rel in _cur_files - _safe_files:
-                _revert_added_file(config.repo_dir, _rel)
-            _guard_restore(config.repo_dir, _safe_snap)
     patch = collect_repo_patch(config.repo_dir)
     logs = truncate_text("\n".join(log_lines), config.max_log_chars)
     return AgentOutcome(
