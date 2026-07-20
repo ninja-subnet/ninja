@@ -2,14 +2,14 @@
   "agent.py",
   "agent/__init__.py",
   "agent/agent_loop.py",
+  "agent/audit.py",
+  "agent/change_echo.py",
   "agent/context.py",
-  "agent/criteria.py",
   "agent/environment.py",
-  "agent/finisher.py",
   "agent/model.py",
-  "agent/pipeline.py",
+  "agent/prefetch.py",
   "agent/prompts.py",
+  "agent/repo_analyser.py",
   "agent/repo_diff.py",
-  "agent/reroll.py",
-  "agent/verify.py"
+  "agent/reroll.py"
 ]

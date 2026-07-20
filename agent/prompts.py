@@ -29,17 +29,11 @@ broad exploration. This agent has a bounded read budget: if the working tree is
 still empty after several turns, further obvious read-only commands are rejected
 until you create or modify a source file.
 
-Coverage is scored: a patch is judged by how many of the ISSUE's described requirements it
-implements. THE ISSUE IS THE SPEC - it describes the complete intended fix. Do NOT submit after
-only the primary change: go through EVERY behavior, case, edge condition, and error path the
-ISSUE names and implement each in reachable code. Keep implementing until every requirement the
-issue describes is covered or time runs out; a partial patch scores far below a complete one.
-IMPORTANT: any preloaded test files are PRE-EXISTING - they already pass and show how the code is
-currently used; they do NOT define the fix (the required new behavior is in the ISSUE, not in
-those tests), so use them only to learn the code's interface and conventions. CRITICAL: implement
-the primary fix FIRST and confirm it works; then ADD the remaining issue requirements as NEW code
-(functions, branches, cases) WITHOUT rewriting or breaking the primary fix. Never trade a working
-requirement for a new one. After each addition, make sure everything you already implemented still holds.
+After any command that modifies files, the observation is followed by
+`[Changed on disk ...]`: the new content of every changed region with line
+numbers. Trust it -- a successful edit never needs a verification read. If it
+instead reports the command changed nothing, your edit's pattern or anchor
+missed the file.
 """
 
 TASK_TEMPLATE = """\
@@ -51,9 +45,7 @@ Please solve this issue:
 {extra_context}
 Deliver a patch a maintainer could review and merge: implement every behavior
 the task asks for in reachable code, tightly scoped to the request, and never
-submit an empty or cosmetic diff. A partial patch that covers only the main
-happy path but misses named cases, files, or edge conditions will score far
-below a complete fix — treat every bullet and named file as mandatory.
+submit an empty or cosmetic diff.
 
 ## Workflow
 
@@ -63,19 +55,18 @@ below a complete fix — treat every bullet and named file as mandatory.
 2. Use `<repository_summary>` and `<context>` first when present, then use
    targeted searches and line ranges to find the file that owns each
    requirement.
-3. By the third command, make the first edit to the owning source file (or
+3. By the fourth command, make the first edit to the owning source file (or
    create the file the task clearly asks for). From then on spend your
    commands implementing, not exploring: do not re-read files you have
    already seen, other than a region you have just edited.
 4. Work through your requirement list one edit at a time until every item is
    implemented at the root cause, matching the existing code style
-   (indentation, quotes, naming). Run syntax and a quick runtime smoke check
-   (`python3 -c '...'` or repo tests); only submit after both pass.
-5. Run a quick syntax check on every file you edited (for example
-   `python3 -m py_compile path/to/file.py`, `node --check path/to/file.js`,
-   or `php -l path/to/file.php`), fix any errors, then re-read each edited
-   region once to confirm it is complete, syntactically valid, and wired into
-   the existing call path.
+   (indentation, quotes, naming). Do not stop at the first working state.
+5. Confirm each edit from the `[Changed on disk ...]` echo that follows it --
+   complete, syntactically valid, correctly placed -- instead of re-reading
+   the file. If the echo says the command changed nothing, the edit missed:
+   re-read the exact target lines and retry with a corrected match. Separately
+   make sure new code is wired into an existing call path.
 6. Finish by running exactly:
 
 ```bash
@@ -112,10 +103,9 @@ EOF
 - Implement every behavior the task describes fully in reachable code before
   you submit: handle each case, input, and condition it names, not only the
   primary one.
-- Before submitting, check every requirement on your list and every acceptance
-  checklist item against your diff; if one is missing, implement it first. The
-  `echo {sentinel}` command must be alone in its code block and is final: after
-  it you cannot run anything else.
+- Before submitting, check every requirement on your list against your diff;
+  if one is missing, implement it first. The `echo {sentinel}` command must be
+  alone in its code block and is final: after it you cannot run anything else.
 """
 
 FORMAT_HELP = """\
@@ -158,70 +148,38 @@ def format_help_message() -> str:
     return FORMAT_HELP.format(sentinel=COMPLETION_SENTINEL) + "```\n"
 
 
-def render_observation(
-    *,
-    returncode: int,
-    output_text: str,
-    remaining_steps: int,
-    patch_text: str = "",
-    issue_text: str = "",
-    remaining_wall: float = 0.0,
-) -> str:
-    remaining_note = ""
-    checklist_note = ""
-    if patch_text.strip() and issue_text.strip():
-        try:
-            from agent.criteria import extract_criteria
-
-            criteria = extract_criteria(issue_text)
-            if criteria:
-                checklist_note = (
-                    "[Checklist: "
-                    + "; ".join(criteria[:4])
-                    + (" ..." if len(criteria) > 4 else "")
-                    + ". Submit when each item is implemented.]"
-                )
-        except Exception:
-            pass
-    if remaining_wall and 0 < remaining_wall <= 25 and patch_text.strip():
-        remaining_note = (
-            f"[About {remaining_wall:.0f}s of wall time remain. You have a diff on disk — "
-            f"verify checklist items, then submit with `echo {COMPLETION_SENTINEL}`.]"
-        )
-    elif checklist_note:
-        remaining_note = checklist_note
-    elif remaining_wall and 0 < remaining_wall <= 50 and not patch_text.strip():
-        remaining_note = (
-            f"[About {remaining_wall:.0f}s of wall time remain and the tree is still empty. "
-            "Make one write to the owning source file next.]"
-        )
-    elif remaining_steps <= 6:
-        patch_lines = 0
-        if patch_text.strip():
-            patch_lines = sum(
-                1
-                for line in patch_text.splitlines()
-                if line.startswith(("+", "-")) and not line.startswith(("+++", "---"))
-            )
-        if patch_lines and patch_lines <= 14 and issue_text.strip():
-            remaining_note = (
-                f"[{remaining_steps} command(s) left. The diff is still small for this "
-                f"multi-part task — implement every remaining requirement in the owning "
-                f"source file(s), run a syntax check, then submit with "
-                f"`echo {COMPLETION_SENTINEL}`.]"
-            )
-        elif remaining_steps <= 3:
-            remaining_note = (
-                f"[{remaining_steps} command(s) left. Finish any missing requirements, "
-                f"then submit with `echo {COMPLETION_SENTINEL}`.]"
-            )
-        else:
-            remaining_note = (
-                f"[{remaining_steps} command(s) left. Verify every acceptance checklist "
-                f"item before submitting.]"
-            )
+def render_observation(*, returncode: int, output_text: str, time_note: str = "") -> str:
+    """``time_note``: the wall-clock pressure note for this turn, or "" (see
+    ``agent_loop._time_pressure_note``). Pressure is denominated in real seconds
+    at fixed budget fractions, not in projected commands-left: the mean-step
+    projection under-warned every run whose late steps ran several times the
+    early mean, so those runs died mid-edit having never been told to wrap up."""
     return OBSERVATION_TEMPLATE.format(
         returncode=returncode,
         output=output_text,
-        remaining_note=remaining_note,
+        remaining_note=time_note,
     )
+
+
+# Escalating wall-clock notes, fired once each by the loop. "half"/"late" push
+# the switch from exploring to implementing; "final" allows one last
+# self-contained edit.
+_TIME_NOTES = {
+    "half": (
+        "[Time check: about {left}s of wall clock remain -- half the budget is "
+        "gone. You must now start implementing the tasks you have figured out so far.]"
+    ),
+    "late": (
+        "[Time check: about {left}s of wall clock remain. Stop exploring and start implementing. "
+        "Start implementing, starting with the most important ones]"
+    ),
+    "final": (
+        "[Final window: about {left}s of wall clock remain. You have time for at "
+        "most ONE more self-contained edit: do not modify code that already "
+        "works, and do not start a change that needs a follow-up command. Implement the single most important remaining item which can be implemented in one command]"
+    ),
+}
+
+
+def time_pressure_note(*, phase: str, time_left_s: float) -> str:
+    return _TIME_NOTES[phase].format(left=max(0, int(time_left_s)))

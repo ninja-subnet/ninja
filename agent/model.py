@@ -4,15 +4,30 @@ validator-managed proxy configuration passed into agent.solve().
 """
 
 import json
+import re
 import time
 import urllib.error
 import urllib.request
 
 _RETRYABLE_STATUS = {408, 409, 425, 429, 500, 502, 503, 504}
 
+# The server rejects a request whose prompt + requested max_tokens exceeds its
+# window (vLLM --max-model-len). We only ever see the prompt in CHARACTERS, so we
+# carry a chars-per-token ratio and keep it honest against the token counts the
+# server reports back. It varies with content density (2.6 on dense code, 5.1 on
+# prose), so a fixed ratio is not safe to assume; this is the value we start from
+# before the first response lands, chosen below the densest ratio we have measured.
+_INITIAL_CHARS_PER_TOKEN = 2.5
+_CONTEXT_LENGTH_MARKER = "maximum context length"
+_PROMPT_TOKENS_RE = re.compile(r"prompt contains at least (\d+) input tokens")
+
 
 class ModelQueryError(RuntimeError):
     pass
+
+
+class ContextLengthError(ModelQueryError):
+    """The prompt overflowed the server's window. Recoverable: compact and retry."""
 
 
 class ChatModel:
@@ -35,6 +50,11 @@ class ChatModel:
         self.calls = 0
         self.prompt_tokens = 0
         self.completion_tokens = 0
+        # Live chars-per-token for THIS run's content, re-measured on every response
+        # (and corrected from the error body when the server rejects an overflow).
+        # The caller sizes its compaction budget off this.
+        self.chars_per_token = _INITIAL_CHARS_PER_TOKEN
+        self._sent_prompt_chars = 0
 
     def query(self, messages: list) -> str:
         """Send the conversation and return the assistant message text."""
@@ -42,6 +62,7 @@ class ChatModel:
         if self.max_completion_tokens > 0:
             payload["max_tokens"] = self.max_completion_tokens
         body = json.dumps(payload).encode("utf-8")
+        self._sent_prompt_chars = messages_chars(messages)
         last_error = "unknown error"
         for attempt in range(1, self.max_attempts + 1):
             try:
@@ -49,6 +70,9 @@ class ChatModel:
             except urllib.error.HTTPError as exc:
                 detail = _read_error_body(exc)
                 last_error = f"HTTP {exc.code}: {detail[:300]}"
+                if _CONTEXT_LENGTH_MARKER in detail.lower():
+                    self._recalibrate_from_overflow(detail)
+                    raise ContextLengthError(f"prompt exceeds the model window: {last_error}") from exc
                 if exc.code not in _RETRYABLE_STATUS:
                     raise ModelQueryError(f"model request was rejected: {last_error}") from exc
             except (urllib.error.URLError, TimeoutError, OSError) as exc:
@@ -80,8 +104,10 @@ class ChatModel:
             raise ModelQueryError(f"model returned invalid JSON: {raw[:300]}") from exc
         usage = payload.get("usage") if isinstance(payload, dict) else None
         if isinstance(usage, dict):
-            self.prompt_tokens += _as_int(usage.get("prompt_tokens"))
+            prompt_tokens = _as_int(usage.get("prompt_tokens"))
+            self.prompt_tokens += prompt_tokens
             self.completion_tokens += _as_int(usage.get("completion_tokens"))
+            self._observe_ratio(prompt_tokens)
         choices = payload.get("choices") if isinstance(payload, dict) else None
         if not isinstance(choices, list) or not choices:
             raise ModelQueryError(f"model response has no choices: {raw[:300]}")
@@ -94,6 +120,26 @@ class ChatModel:
         if not isinstance(content, str):
             raise ModelQueryError(f"model response has no text content: {raw[:300]}")
         return content
+
+
+    def _observe_ratio(self, prompt_tokens: int) -> None:
+        """Re-measure chars-per-token from what the server actually counted."""
+        if prompt_tokens > 0 and self._sent_prompt_chars > 0:
+            self.chars_per_token = self._sent_prompt_chars / prompt_tokens
+
+    def _recalibrate_from_overflow(self, detail: str) -> None:
+        """We overflowed, so our ratio was too optimistic. The server names the real
+        input-token count in the error; trust it. Absent that, back the ratio off
+        enough that the retry is meaningfully smaller rather than failing again."""
+        match = _PROMPT_TOKENS_RE.search(detail)
+        if match:
+            self._observe_ratio(int(match.group(1)))
+        else:
+            self.chars_per_token *= 0.85
+
+
+def messages_chars(messages: list) -> int:
+    return sum(len(str(item.get("role", ""))) + len(str(item.get("content", ""))) for item in messages)
 
 
 def _read_error_body(exc: urllib.error.HTTPError) -> str:

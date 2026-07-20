@@ -1,4 +1,11 @@
-"""Primary-draw wrapper: rebuilds context + checklist, runs the base loop once."""
+"""Primary-draw wrapper: rebuilds the initial prompt with a fuller repository
+summary and a shortlist of likely edit targets, runs the base loop once for the
+full wall, and falls open to the on-disk diff on any error.
+
+The loop opens on the deterministic shortlist (instant) while ``agent.prefetch``
+re-ranks the same candidates with a model call on a daemon thread; when that
+lands, the loop swaps the sharper list in. Both the thread and the swap are
+best-effort: if either fails, the run is exactly what it was without them."""
 
 from __future__ import annotations
 
@@ -6,7 +13,6 @@ import dataclasses
 
 from agent.agent_loop import AgentOutcome, run_agent_loop
 from agent.context import build_context_task
-from agent.criteria import extract_criteria, format_checklist
 from agent.repo_diff import collect_repo_patch
 
 
@@ -16,19 +22,32 @@ def run_best_of_two(base_config, task, issue_text) -> AgentOutcome:
     try:
         rebuilt = build_context_task(issue_text, repo)
         if rebuilt and "<task>" in rebuilt:
-            checklist = format_checklist(extract_criteria(issue_text))
-            run_task = rebuilt + checklist if checklist else rebuilt
+            run_task = rebuilt
     except Exception:
         run_task = task
-    run_config = dataclasses.replace(
-        base_config,
-        issue_text=issue_text or getattr(base_config, "issue_text", ""),
-    )
     try:
-        outcome = run_agent_loop(config=run_config, task=run_task)
+        outcome = run_agent_loop(
+            config=base_config, task=run_task, task_updater=_start_prefetch(base_config, repo, issue_text)
+        )
     except Exception:
         outcome = _floor_outcome(repo)
     return _outcome_on_disk(outcome, repo)
+
+
+def _start_prefetch(base_config, repo, issue_text):
+    """The loop's task_updater, or None if the re-rank can't even be started."""
+    try:
+        from agent.prefetch import start
+
+        return start(
+            issue=issue_text,
+            repo_dir=repo,
+            model_name=base_config.model_name,
+            base_url=base_config.base_url,
+            auth_token=base_config.auth_token,
+        )
+    except Exception:  # noqa: BLE001 - the loop must run with or without a re-rank
+        return None
 
 
 def _outcome_on_disk(outcome, repo):
