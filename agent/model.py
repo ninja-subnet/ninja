@@ -50,11 +50,23 @@ class ChatModel:
         self.calls = 0
         self.prompt_tokens = 0
         self.completion_tokens = 0
+        # Per-call completion size + whether the reply hit the token cap. The loop
+        # uses these to abort full-file rewrite spirals that burn the wall clock
+        # (duel-101923 r14/r26: two consecutive 4096-token replies ate ~450s).
+        self.last_completion_tokens = 0
+        self.last_finish_reason = ""
         # Live chars-per-token for THIS run's content, re-measured on every response
         # (and corrected from the error body when the server rejects an overflow).
         # The caller sizes its compaction budget off this.
         self.chars_per_token = _INITIAL_CHARS_PER_TOKEN
         self._sent_prompt_chars = 0
+
+    def last_reply_hit_token_cap(self) -> bool:
+        """True when the latest reply was cut off by max_tokens."""
+        if self.last_finish_reason == "length":
+            return True
+        cap = self.max_completion_tokens
+        return cap > 0 and self.last_completion_tokens >= max(1, cap - 4)
 
     def query(self, messages: list) -> str:
         """Send the conversation and return the assistant message text."""
@@ -103,15 +115,20 @@ class ChatModel:
         except ValueError as exc:
             raise ModelQueryError(f"model returned invalid JSON: {raw[:300]}") from exc
         usage = payload.get("usage") if isinstance(payload, dict) else None
+        completion_tokens = 0
         if isinstance(usage, dict):
             prompt_tokens = _as_int(usage.get("prompt_tokens"))
+            completion_tokens = _as_int(usage.get("completion_tokens"))
             self.prompt_tokens += prompt_tokens
-            self.completion_tokens += _as_int(usage.get("completion_tokens"))
+            self.completion_tokens += completion_tokens
             self._observe_ratio(prompt_tokens)
+        self.last_completion_tokens = completion_tokens
         choices = payload.get("choices") if isinstance(payload, dict) else None
         if not isinstance(choices, list) or not choices:
             raise ModelQueryError(f"model response has no choices: {raw[:300]}")
-        message = choices[0].get("message") if isinstance(choices[0], dict) else None
+        choice0 = choices[0] if isinstance(choices[0], dict) else {}
+        self.last_finish_reason = str(choice0.get("finish_reason") or "")
+        message = choice0.get("message") if isinstance(choice0, dict) else None
         content = message.get("content") if isinstance(message, dict) else None
         if isinstance(content, list):
             content = "".join(

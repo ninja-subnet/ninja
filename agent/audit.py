@@ -36,8 +36,10 @@ _MAX_DIFF_CHARS = 24_000
 # One audit turn is a single generation plus at most one gap-closing edit;
 # 60s/4-commands starved the audit in exactly the late-submitting runs that
 # needed it most (duel-20260716: 3 of 9 RCA'd losses skipped it on budget).
+# Keep the floor low enough that a late submit still gets one gap-check, but
+# not so low that we burn the kill window on an audit turn (duel-863250).
 _MIN_COMMANDS_LEFT = 2
-_MIN_TIME_LEFT_S = 45.0
+_MIN_TIME_LEFT_S = 50.0
 _TASK_BLOCK_RE = re.compile(r"<task>.*?</task>", re.DOTALL)
 _DIFF_FILE_RE = re.compile(r"^diff --git a/.*? b/(.*)$", re.MULTILINE)
 _TASK_FALLBACK_CHARS = 6_000

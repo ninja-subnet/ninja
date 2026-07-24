@@ -29,6 +29,7 @@ import re
 
 from agent.prompts import build_task_prompt
 from agent.repo_analyser import list_repo_files, rank_files, repo_digest
+from agent.criteria import extract_criteria, format_checklist
 
 # Above this many files a raw path listing is worse than useless: it is too long
 # to read, it buries the <task> it is supposed to support (a 400-path listing of
@@ -43,7 +44,10 @@ DIGEST_MIN_FILES = 50
 # deterministic ranker's top-2 is precision 0.60, and it is only what the loop
 # opens on -- ``prefetch.py`` swaps in a longer, sharper list when its background
 # re-rank lands (see MAX_RETURN there).
-SHORTLIST_MAX_FILES = 2
+# Duel-959988 near-miss / 863250 under-patches: top-2 recall left wiring and
+# secondary owners off the opening prompt. 4 paths still fit; prefetch may swap
+# a sharper list later.
+SHORTLIST_MAX_FILES = 4
 # Total content budget across every file whose body is embedded. Content is only
 # ever embedded for task-named files, so this is not a cap on the shortlist.
 PRELOAD_MAX_CHARS = 8000
@@ -66,9 +70,15 @@ def build_context_task(issue, repo_dir, limit=SHORTLIST_MAX_FILES, ranked=None):
     paths = list_repo_files(repo_dir)
     summary = repo_digest(paths) if len(paths) > DIGEST_MIN_FILES else "\n".join(paths)
     shortlist = shortlist_files(issue, repo_dir, paths, limit=limit, ranked=ranked)
-    return build_task_prompt(task_text=(issue or "").strip(),
-                             repo_summary=summary,
-                             preloaded_context=_render(shortlist, repo_dir))
+    prompt = build_task_prompt(
+        task_text=(issue or "").strip(),
+        repo_summary=summary,
+        preloaded_context=_render(shortlist, repo_dir),
+    )
+    checklist = format_checklist(extract_criteria(issue or ""))
+    if checklist:
+        prompt = prompt.rstrip() + "\n" + checklist
+    return prompt
 
 
 def shortlist_files(issue, repo_dir, paths=None, limit=SHORTLIST_MAX_FILES, ranked=None):

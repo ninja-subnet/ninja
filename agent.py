@@ -44,6 +44,7 @@ from agent.agent_loop import (
 )
 from agent.prompts import build_task_prompt
 from agent.repo_diff import collect_repo_patch
+from agent.criteria import extract_criteria, format_checklist
 
 # -----------------------------
 # Config
@@ -150,7 +151,13 @@ def _resolve_inference_config(
 
 
 def build_initial_user_prompt(issue: str, repo_summary: str, preloaded_context: str = "") -> str:
-    return build_task_prompt(task_text=issue, repo_summary=repo_summary, preloaded_context=preloaded_context)
+    prompt = build_task_prompt(
+        task_text=issue, repo_summary=repo_summary, preloaded_context=preloaded_context
+    )
+    checklist = format_checklist(extract_criteria(issue))
+    if checklist:
+        prompt = prompt.rstrip() + "\n" + checklist
+    return prompt
 
 
 def build_repo_summary(repo_dir: str) -> str:
@@ -248,6 +255,7 @@ def solve(
             max_log_chars=MAX_TOTAL_LOG_CHARS,
             max_model_len=MAX_MODEL_LEN,
             wall_clock_limit=WALL_CLOCK_LIMIT_SECONDS,
+            issue_text=issue or "",
         )
         task_prompt = build_initial_user_prompt(issue, repo_summary, preloaded_context)
         try:
@@ -258,6 +266,22 @@ def solve(
             outcome = run_best_of_two(run_config, task_prompt, issue)
         else:
             outcome = run_agent_loop(config=run_config, task=task_prompt)
+        # Mean-score catastrophic floor: empty diffs are hard zeros. Spend any
+        # leftover wall on a write-only finisher before returning.
+        if not (outcome.patch or "").strip():
+            try:
+                from agent.finisher import run_finisher
+
+                deadline = started + WALL_CLOCK_LIMIT_SECONDS
+                salvaged = run_finisher(run_config, repo_path, issue or "", deadline)
+                if salvaged.strip():
+                    outcome.patch = salvaged
+                    outcome.success = True
+                    outcome.message = (
+                        f"{outcome.message}; finisher salvaged nonempty patch"
+                    )
+            except Exception:
+                pass
         elapsed = time.monotonic() - started
         return {
             "patch": outcome.patch,
