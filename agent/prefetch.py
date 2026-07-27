@@ -136,6 +136,21 @@ def _select_files(*, issue, repo_dir, model_name, base_url, auth_token):
     pool = [path for path, _score in rank_files(issue or "", repo_dir)][:CANDIDATE_POOL_N]
     if not pool:
         return None
+    # Append 1-hop dependency-graph neighbours of the top seeds so the model can
+    # pick the importers/registries/siblings the keyword ranker never scored.
+    # Appended AFTER the keyword pool (never displacing it); the model re-rank then
+    # filters them by precision. This runs on the prefetch daemon thread, off the
+    # opening critical path. Best-effort: on any error the pool is unchanged.
+    try:
+        from agent.graph_expand import expand_by_graph, GRAPH_SEED_K
+        from agent.repo_analyser import list_repo_files
+        existing = set(pool)
+        for nb in expand_by_graph(pool[:GRAPH_SEED_K], repo_dir, list_repo_files(repo_dir), cap=12):
+            if nb not in existing:
+                pool.append(nb)
+                existing.add(nb)
+    except Exception:  # noqa: BLE001 - the pool addition is best-effort
+        pass
     model = ChatModel(
         model_name=model_name,
         base_url=base_url,

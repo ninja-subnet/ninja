@@ -8,6 +8,7 @@
   "agent/criteria.py",
   "agent/environment.py",
   "agent/finisher.py",
+  "agent/graph_expand.py",
   "agent/guards.py",
   "agent/model.py",
   "agent/prefetch.py",

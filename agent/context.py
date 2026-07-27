@@ -47,7 +47,12 @@ DIGEST_MIN_FILES = 50
 # Duel-959988 near-miss / 863250 under-patches: top-2 recall left wiring and
 # secondary owners off the opening prompt. 4 paths still fit; prefetch may swap
 # a sharper list later.
-SHORTLIST_MAX_FILES = 4
+# Paths-only channel, so a wrong entry costs one read (never content-priming).
+# Widened from 4: a multi-file task needs 7-9 targets, and the blind window before
+# the model re-rank lands must name enough of them for the solver to edit rather
+# than grep-discover. The extra slots are filled from the keyword ranker and then
+# 1-hop dependency-graph neighbours of the top seeds.
+SHORTLIST_MAX_FILES = 8
 # Total content budget across every file whose body is embedded. Content is only
 # ever embedded for task-named files, so this is not a cap on the shortlist.
 PRELOAD_MAX_CHARS = 8000
@@ -75,10 +80,70 @@ def build_context_task(issue, repo_dir, limit=SHORTLIST_MAX_FILES, ranked=None):
         repo_summary=summary,
         preloaded_context=_render(shortlist, repo_dir),
     )
-    checklist = format_checklist(extract_criteria(issue or ""))
+    criteria = extract_criteria(issue or "")
+    checklist = format_checklist(criteria)
     if checklist:
         prompt = prompt.rstrip() + "\n" + checklist
+    hints = _criteria_file_hints(criteria, shortlist, repo_dir)
+    if hints:
+        prompt = prompt.rstrip() + "\n" + hints
     return prompt
+
+
+# Requirement -> owning-file map. On a multi-requirement task the recovered
+# shortlist files only convert to score if the solver edits the RIGHT one per
+# requirement; keyword-matching each requirement to its best shortlist file turns
+# the paths-only channel into targeted coverage. Advisory (the solver decides),
+# only for >=3-requirement tasks (the multi-file band), and only over files
+# already in the shortlist, so it never invents scope. Fail-open to no block.
+_HINT_MIN_CRITERIA = 3
+_HINT_MAX_ROWS = 8
+_HINT_STOPWORDS = frozenset({
+    "should", "must", "when", "that", "this", "with", "from", "into", "have",
+    "will", "which", "there", "their", "then", "than", "here", "does", "using",
+    "make", "sure", "also", "each", "some", "these", "those", "such", "given",
+    "return", "value", "function", "class", "method", "code", "file", "test",
+    "support", "ensure", "implement", "update", "handle", "provide", "allow",
+    "every", "concrete", "behavior", "reachable", "symbols", "existing",
+})
+_HINT_TOKEN_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]{3,}")
+
+
+def _criteria_file_hints(criteria, shortlist, repo_dir):
+    try:
+        crits = [c for c in (criteria or []) if c and c.strip()]
+        files = [rel for rel, _named in (shortlist or [])]
+        if len(crits) < _HINT_MIN_CRITERIA or len(files) < 2:
+            return ""
+        # Cheap per-file token bag: path segments + a small content head.
+        bag = {}
+        for rel in files:
+            toks = set(_HINT_TOKEN_RE.findall(rel.lower()))
+            body = _read_file(repo_dir, rel)[:2000].lower() if rel else ""
+            toks |= set(_HINT_TOKEN_RE.findall(body))
+            bag[rel] = toks - _HINT_STOPWORDS
+        rows = []
+        for c in crits[:_HINT_MAX_ROWS]:
+            kws = [w for w in _HINT_TOKEN_RE.findall(c.lower()) if w not in _HINT_STOPWORDS]
+            if not kws:
+                continue
+            best, best_score = None, 0
+            for rel in files:
+                score = sum(1 for w in kws if w in bag[rel])
+                if score > best_score:
+                    best, best_score = rel, score
+            if best is not None and best_score >= 1:
+                rows.append(f"  - {c[:90]} -> likely in `{best}`")
+        if not rows:
+            return ""
+        return (
+            "\n## Where each requirement likely lives\n"
+            "A complete solution usually spans multiple files. Implement each "
+            "requirement in its owning file below (verify by reading it first); "
+            "do not stop after the first file.\n" + "\n".join(rows) + "\n"
+        )
+    except Exception:  # noqa: BLE001 - an optimization, never fatal
+        return ""
 
 
 def shortlist_files(issue, repo_dir, paths=None, limit=SHORTLIST_MAX_FILES, ranked=None):
@@ -105,6 +170,24 @@ def shortlist_files(issue, repo_dir, paths=None, limit=SHORTLIST_MAX_FILES, rank
             break
         if rel not in named:
             out.append((rel, False))
+    # Fill any remaining slots with 1-hop dependency-graph neighbours of the top
+    # keyword seeds -- the importers/registries/siblings the keyword ranker cannot
+    # see. Appended AFTER the keyword candidates (never displacing them) and only
+    # as paths. Best-effort with a hard time budget; if it yields nothing the
+    # shortlist is exactly the keyword one.
+    if len(out) < limit and ranked:
+        try:
+            from agent.graph_expand import expand_by_graph, GRAPH_SEED_K
+            all_files = paths if paths is not None else list_repo_files(repo_dir)
+            chosen = {rel for rel, _n in out}
+            for rel in expand_by_graph(list(ranked)[:GRAPH_SEED_K], repo_dir, all_files, cap=limit):
+                if len(out) >= limit:
+                    break
+                if rel not in named and rel not in chosen:
+                    out.append((rel, False))
+                    chosen.add(rel)
+        except Exception:  # noqa: BLE001 - the shortlist is an optimization, never fatal
+            pass
     return out
 
 

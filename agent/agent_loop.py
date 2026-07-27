@@ -74,6 +74,13 @@ _MIN_SUBSTANTIVE_CHANGED_LINES = 3
 _TRIVIAL_PATCH_MIN_TIME_LEFT_S = 50.0
 # One expand reject for clearly under-scoped multi-req stubs (863250 r14/r32).
 _THIN_EXPAND_MIN_TIME_LEFT_S = 70.0
+# A patch that is thin for the shape of the task is nudged to expand. The base loop
+# does this once; a single nudge often moves a patch only part of the way, so the
+# nudge repeats while (a) the patch is STILL objectively thin, (b) wall clock allows
+# another edit, and (c) the previous nudge actually GREW the diff. Condition (c) is
+# what stops the nudge demanding filler: a round that adds nothing is accepted at once.
+_MAX_THIN_EXPANDS = 3
+_THIN_EXPAND_MIN_GROWTH = 4
 _RECENT_MESSAGE_COUNT = 8
 _COMPACT_MESSAGE_CHARS = 1200
 _MIN_COMPACT_MESSAGE_CHARS = 600
@@ -82,10 +89,16 @@ _MAX_CONTEXT_RETRIES = 2
 DEFAULT_MAX_MODEL_LEN = 32768
 # Duel-863250: max_tokens=1536 correlated with thinner incomplete patches
 # (mean lines 246→181, Δ +0.037→-0.068). Restore the 645807-era budget.
-DEFAULT_MAX_TOKENS = 2048
-_EMPTY_TREE_MAX_TOKENS = 1536
+# Completion budget: the limit on how much of a change can land in a single turn.
+# A tighter cap measurably thins patches -- edits arrive truncated or split across turns
+# the wall clock may not grant -- and a thin patch on a multi-part task scores badly.
+# Raised a step for that reason; completions are a small share of a run's tokens.
+DEFAULT_MAX_TOKENS = 4096
+# The empty-tree cap tightens the first turns to force an early edit; keep that pressure but
+# stop it from truncating the first real multi-hunk write.
+_EMPTY_TREE_MAX_TOKENS = 2560
 # Only reject clearly pathological actionable bodies (full-file paste spirals).
-_MAX_ACTIONABLE_REPLY_CHARS = 14000
+_MAX_ACTIONABLE_REPLY_CHARS = 20000
 _CHECKLIST_MIN_STEP = 3
 _CHECKLIST_MIN_ITEMS = 2
 _CHECKLIST_MIN_TIME_LEFT_S = 80.0
@@ -122,6 +135,68 @@ class AgentOutcome:
     message: str
     exit_status: str = "Submitted"
     transcript: list = field(default_factory=list)
+
+
+# --- redundant-nudge skip ----------------------------------------------------
+# The expand reminder and the progress checklist both ask for a larger edit.
+# When the current patch already implements most of the task's listed
+# requirements, that reminder is redundant and only invites unrelated edits, so
+# _well_covered() skips it in that case. A partial edit does not clear the bar,
+# so it still receives the reminder. Fail-open (never skip on error), so a
+# failure path reproduces the default behavior exactly.
+_COVERAGE_SKIP_FRAC = 0.7
+_COVERAGE_MIN_CRITERIA = 3
+_COVERAGE_STOPWORDS = {
+    "should", "must", "when", "that", "this", "with", "from", "into", "have",
+    "will", "which", "there", "their", "then", "than", "here", "does", "using",
+    "make", "sure", "also", "each", "some", "these", "those", "such", "given",
+    "return", "value", "function", "class", "method", "code", "file", "test",
+    "support", "ensure", "implement", "update", "handle", "provide", "allow",
+}
+_COVER_BULLET_RE = re.compile(r"^[-*•]\s+\S|^\d+[.)]\s+\S")
+_COVER_STRIP_RE = re.compile(r"^[-*•]\s+|^\d+[.)]\s+")
+_COVER_TOKEN_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]{3,}")
+
+
+def _bullet_criteria(issue_text):
+    out = []
+    for line in (issue_text or "").splitlines():
+        s = line.strip()
+        if _COVER_BULLET_RE.match(s):
+            out.append(_COVER_STRIP_RE.sub("", s))
+    return out
+
+
+def _added_text_lower(patch_text):
+    return "\n".join(
+        ln[1:] for ln in (patch_text or "").splitlines()
+        if ln.startswith("+") and not ln.startswith("+++")
+    ).lower()
+
+
+def _criterion_covered(criterion, added):
+    kws = [w for w in _COVER_TOKEN_RE.findall(criterion.lower())
+           if w not in _COVERAGE_STOPWORDS]
+    if not kws:
+        return False  # no salient keyword to confirm -> do NOT count as covered
+    return sum(1 for w in kws if w in added) * 2 >= len(kws)
+
+
+def _well_covered(issue_text, patch_text):
+    """True when the patch already implements >= _COVERAGE_SKIP_FRAC of the
+    task's listed requirements. Fail-open to False (never skip) so any error path
+    keeps the default expand/checklist behavior."""
+    try:
+        crits = _bullet_criteria(issue_text)
+        if len(crits) < _COVERAGE_MIN_CRITERIA:
+            return False
+        added = _added_text_lower(patch_text)
+        if not added.strip():
+            return False
+        covered = sum(1 for c in crits if _criterion_covered(c, added))
+        return covered >= _COVERAGE_SKIP_FRAC * len(crits)
+    except Exception:
+        return False
 
 
 def run_agent_loop(*, config: AgentRunConfig, task: str, task_updater=None) -> AgentOutcome:
@@ -165,7 +240,8 @@ def run_agent_loop(*, config: AgentRunConfig, task: str, task_updater=None) -> A
     final_window_reads = 0
     checklist_sent = False
     hygiene_reject_sent = False
-    thin_expand_sent = False
+    thin_expands = 0
+    thin_last_lines = 0
     sprawl_nudge_sent = False
 
     for step in range(1, max(1, config.max_steps) + 1):
@@ -349,14 +425,25 @@ def run_agent_loop(*, config: AgentRunConfig, task: str, task_updater=None) -> A
                     log_lines.append(f"[step {step}] patch hygiene rejected: {hygiene_reason}")
                     continue
             thin_reason = thin_relative_to_task_reason(config.issue_text, patch_text)
-            if thin_reason and not thin_expand_sent:
+            _thin_now = _count_changed_lines(patch_text)
+            _thin_grew = (
+                thin_expands == 0
+                or _thin_now >= thin_last_lines + _THIN_EXPAND_MIN_GROWTH
+            )
+            if (
+                thin_reason
+                and thin_expands < _MAX_THIN_EXPANDS
+                and _thin_grew
+                and not _well_covered(config.issue_text, patch_text)
+            ):
                 time_left_now = (
                     config.wall_clock_limit - (time.monotonic() - started)
                     if config.wall_clock_limit > 0
                     else None
                 )
                 if time_left_now is None or time_left_now >= _THIN_EXPAND_MIN_TIME_LEFT_S:
-                    thin_expand_sent = True
+                    thin_expands += 1
+                    thin_last_lines = _thin_now
                     messages.append({
                         "role": "user",
                         "content": _thin_expand_message(thin_reason),
@@ -487,6 +574,7 @@ def run_agent_loop(*, config: AgentRunConfig, task: str, task_updater=None) -> A
             and has_patch
             and step >= _CHECKLIST_MIN_STEP
             and config.issue_text
+            and not _well_covered(config.issue_text, on_disk_now)
         ):
             time_left_now = (
                 config.wall_clock_limit - (time.monotonic() - started)
